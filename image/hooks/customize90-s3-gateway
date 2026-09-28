@@ -1,0 +1,202 @@
+#!/bin/bash
+# rpi-image-gen build hook: bakes the S3 Zigbee Gateway application into the
+# golden image. Runs on the BUILD HOST against the target rootfs, which is
+# passed in as $1 (rpi-image-gen's customize hook convention).
+#
+# What this does NOT do, on purpose, because it needs a live running system
+# (systemd actually managing services, PostgreSQL actually accepting
+# connections) which a build-time chroot does not have:
+#   - create the PostgreSQL role/database/schema
+#   - set a real GATEWAY_ID
+#   - install a site's samplelist.csv / pygw_conf.py
+#   - run s3-gateway-dbup
+# Those all happen at first boot instead - see image/firstboot/.
+set -euo pipefail
+
+ROOTFS="$1"
+HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$HOOK_DIR")"
+SRC="$PROJECT_DIR/s3-zigbee-gateway"
+FIRSTBOOT_SRC="$PROJECT_DIR/firstboot"
+
+SERVICE_USER="${S3_SERVICE_USER:-s3gw}"
+TARGET_DIR="${S3_TARGET_DIR:-/opt/s3-gateway/app}"
+OPERATOR_USER="${S3_OPERATOR_USER:-pi}"
+OPERATOR_DIR="${S3_OPERATOR_DIR:-/home/pi/S3Gateway}"
+SERVICE_NAME="s3-zigbee-gateway"
+
+if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
+    echo "ERROR: $SRC does not look like the s3-zigbee-gateway source tree." >&2
+    echo "Unzip your s3-zigbee-gateway.zip into image/s3-zigbee-gateway/ first." >&2
+    echo "See image/s3-zigbee-gateway/PUT_YOUR_REPO_HERE.txt" >&2
+    exit 1
+fi
+
+echo "==> Excluding wlan0 from systemd-networkd-wait-online (no WiFi profile is baked in, so wlan0 never gets a carrier - without this, wait-online fails every boot and delays s3-zigbee-gateway.service, which orders After=network-online.target)"
+cat >> "$ROOTFS/etc/systemd/network/02-wlan0.network" <<'EOF'
+
+[Link]
+RequiredForOnline=no
+EOF
+
+echo "==> Ensuring required packages are installed"
+# rpi-image-gen's own packages: section (in gateway-golden.yaml) DOES work,
+# but its consuming hook (builtin/hooks/customize20-packages) runs AFTER all
+# of this project's own hooks in the customize phase - too late for the venv
+# creation a few lines below, which needs python3.13-venv/postgresql already
+# present. Installing here explicitly is a real ordering requirement, not a
+# workaround for something broken; customize20-packages re-running its own
+# install later is a harmless no-op ("already the newest version").
+chroot "$ROOTFS" apt-get update
+chroot "$ROOTFS" apt-get install -y \
+    git rsync acl sudo usbutils iproute2 \
+    python3 python3-venv python3.13-venv python3-pip \
+    postgresql postgresql-client
+
+echo "==> Copying application source into $ROOTFS$TARGET_DIR"
+install -d -m 755 "$ROOTFS$TARGET_DIR"
+rsync -a \
+    --exclude=.git/ \
+    --exclude=.env \
+    --exclude=PYSerialGateway/log/ \
+    --exclude=PYSerialGateway/errorlog/ \
+    --exclude=PYSerialGateway/GPSlog/ \
+    --exclude=pyserialgateway/log/ \
+    --exclude=pyserialgateway/errorlog/ \
+    --exclude='*.mqtt.db' \
+    "$SRC/" "$ROOTFS$TARGET_DIR/"
+
+echo "==> Creating service account and Python venv inside the image"
+chroot "$ROOTFS" bash -c "
+set -euo pipefail
+id '$SERVICE_USER' >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin '$SERVICE_USER'
+usermod -a -G dialout '$SERVICE_USER'
+python3 -m venv '$TARGET_DIR/.venv'
+'$TARGET_DIR/.venv/bin/pip' install --upgrade pip
+'$TARGET_DIR/.venv/bin/pip' install -r '$TARGET_DIR/requirements.txt'
+"
+
+echo "==> Writing baseline .env (GATEWAY_ID left UNPROVISIONED on purpose)"
+cp "$ROOTFS$TARGET_DIR/.env.example" "$ROOTFS$TARGET_DIR/.env"
+sed -i "s/^DB_USER=.*/DB_USER=${SERVICE_USER}/" "$ROOTFS$TARGET_DIR/.env"
+sed -i "s/^GATEWAY_ID=.*/GATEWAY_ID=UNPROVISIONED/" "$ROOTFS$TARGET_DIR/.env"
+sed -i "s|^MQTT_LOG_FILE=.*|MQTT_LOG_FILE=${OPERATOR_DIR}/log/mqtt.log|" "$ROOTFS$TARGET_DIR/.env"
+sed -i "s|^GATEWAY_LOG_DIR=.*|GATEWAY_LOG_DIR=${OPERATOR_DIR}/log|" "$ROOTFS$TARGET_DIR/.env"
+sed -i "s|^GATEWAY_ERROR_LOG_DIR=.*|GATEWAY_ERROR_LOG_DIR=${OPERATOR_DIR}/log|" "$ROOTFS$TARGET_DIR/.env"
+# If your fleet shares one production broker/credentials, uncomment and edit:
+# sed -i "s/^MQTT_ENABLED=.*/MQTT_ENABLED=true/" "$ROOTFS$TARGET_DIR/.env"
+# sed -i "s/^MQTT_BROKER=.*/MQTT_BROKER=60.49.248.65/" "$ROOTFS$TARGET_DIR/.env"
+# sed -i "s/^MQTT_PORT=.*/MQTT_PORT=1884/" "$ROOTFS$TARGET_DIR/.env"
+# sed -i "s/^MQTT_USERNAME=.*/MQTT_USERNAME=otbr/" "$ROOTFS$TARGET_DIR/.env"
+# sed -i "s/^MQTT_PASSWORD=.*/MQTT_PASSWORD=senatraffic/" "$ROOTFS$TARGET_DIR/.env"
+chroot "$ROOTFS" chown root:"$SERVICE_USER" "$TARGET_DIR/.env"
+chroot "$ROOTFS" chmod 640 "$TARGET_DIR/.env"
+
+echo "==> Seeding operator workspace at $OPERATOR_DIR"
+install -d -m 755 "$ROOTFS$OPERATOR_DIR"
+install -m 644 "$SRC/PYSerialGateway/samplelist.csv" "$ROOTFS$OPERATOR_DIR/samplelist.csv"
+install -m 644 "$SRC/PYSerialGateway/pygw_conf.py" "$ROOTFS$OPERATOR_DIR/pygw_conf.py"
+[ -f "$SRC/PYSerialGateway/README-OPERATOR.md" ] && install -m 644 "$SRC/PYSerialGateway/README-OPERATOR.md" "$ROOTFS$OPERATOR_DIR/README-OPERATOR.md"
+chroot "$ROOTFS" chown -R "${OPERATOR_USER}:${OPERATOR_USER}" "$OPERATOR_DIR"
+
+echo "==> Persisting operator identity for scripts that read /etc/s3-gateway/operator.conf"
+install -d -m 755 "$ROOTFS/etc/s3-gateway"
+cat > "$ROOTFS/etc/s3-gateway/operator.conf" <<EOF
+S3_OPERATOR_USER=$OPERATOR_USER
+S3_OPERATOR_GROUP=$OPERATOR_USER
+S3_OPERATOR_HOME=/home/$OPERATOR_USER
+S3_OPERATOR_DIR=$OPERATOR_DIR
+EOF
+
+echo "==> Installing systemd units, GPSUP override, sudoers, logrotate, dbup wrapper"
+install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway.service" "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service"
+install -d -m 755 "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d"
+install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
+    "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d/override.conf"
+# NOTE: s3-gateway-firstboot.service declares "Before=${SERVICE_NAME}.service"
+# (ordering only, no Requires=) so the two can't form a startup dependency
+# cycle - s3-gateway-dbup itself calls `systemctl start` on this unit from
+# inside the first-boot script. On the very first boot only, the gateway may
+# start once with GATEWAY_ID=UNPROVISIONED / no DB yet and crash-loop for a
+# few seconds (Restart=on-failure already handles this) until first-boot
+# finishes and cleanly restarts it. This is expected and self-healing.
+
+install -m 440 "$SRC/deploy/sudoers/s3-gateway-hwreset" "$ROOTFS/etc/sudoers.d/s3-gateway-hwreset"
+chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-hwreset
+
+install -d -m 755 "$ROOTFS/etc/logrotate.d"
+sed "s#/home/pi/S3Gateway#${OPERATOR_DIR}#g" "$SRC/deploy/logrotate/s3-gateway" \
+    > "$ROOTFS/etc/logrotate.d/s3-gateway"
+
+install -m 755 "$SRC/scripts/s3-gateway-dbup" "$ROOTFS/usr/local/sbin/s3-gateway-dbup"
+install -m 755 "$SRC/scripts/log-maintenance.sh" "$ROOTFS/usr/local/sbin/s3-gateway-log-maintenance"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-maintenance.timer" \
+    "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.timer"
+cat > "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service" <<EOF
+[Unit]
+Description=S3 Gateway log retention maintenance
+
+[Service]
+Type=oneshot
+Environment=GATEWAY_LOG_DIR=${OPERATOR_DIR}/log
+Environment=S3_OPERATOR_CONFIG=/etc/s3-gateway/operator.conf
+ExecStart=/usr/local/sbin/s3-gateway-log-maintenance
+EOF
+
+echo "==> Privileged-path hardening (mirrors install-runtime-hardening.sh)"
+chroot "$ROOTFS" bash -c "
+set -euo pipefail
+chown root:root '$TARGET_DIR' '$TARGET_DIR/pyserialgateway'
+chmod 755 '$TARGET_DIR' '$TARGET_DIR/pyserialgateway'
+chown root:root '$TARGET_DIR/pyserialgateway/hardware_reset.py' '$TARGET_DIR/pyserialgateway/config_PYproperties.py'
+chmod 644 '$TARGET_DIR/pyserialgateway/hardware_reset.py' '$TARGET_DIR/pyserialgateway/config_PYproperties.py'
+rm -rf '$TARGET_DIR/pyserialgateway/__pycache__'
+"
+
+echo "==> Configuring operator GPS access (log dir + GPSlog symlink)"
+install -d -m 2775 "$ROOTFS$OPERATOR_DIR/log"
+install -d -m 2775 "$ROOTFS$OPERATOR_DIR/GPSlog"
+chroot "$ROOTFS" bash -c "
+set -euo pipefail
+chown ${OPERATOR_USER}:${SERVICE_USER} '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
+setfacl -m u:${SERVICE_USER}:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
+setfacl -d -m u:${SERVICE_USER}:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
+setfacl -d -m m:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
+setfacl -m u:${SERVICE_USER}:x /home/${OPERATOR_USER} '$OPERATOR_DIR'
+rm -rf '$TARGET_DIR/PYSerialGateway/GPSlog'
+ln -s '$OPERATOR_DIR/GPSlog' '$TARGET_DIR/PYSerialGateway/GPSlog'
+chown -h root:${SERVICE_USER} '$TARGET_DIR/PYSerialGateway/GPSlog'
+"
+
+echo "==> Symlinking in-app log dirs to the centralized operator log (hardware_reset.py writes here directly via a path relative to itself, not via GATEWAY_LOG_DIR)"
+chroot "$ROOTFS" bash -c "
+set -euo pipefail
+for d in '$TARGET_DIR/PYSerialGateway/log' '$TARGET_DIR/PYSerialGateway/errorlog' '$TARGET_DIR/pyserialgateway/log' '$TARGET_DIR/pyserialgateway/errorlog'; do
+    rm -rf \"\$d\"
+    ln -s '$OPERATOR_DIR/log' \"\$d\"
+    chown -h root:${SERVICE_USER} \"\$d\"
+done
+"
+
+: > "$ROOTFS$OPERATOR_DIR/log/gateway.log"
+: > "$ROOTFS$OPERATOR_DIR/log/error.log"
+: > "$ROOTFS$OPERATOR_DIR/log/mqtt.log"
+chroot "$ROOTFS" chown "${OPERATOR_USER}:${SERVICE_USER}" \
+    "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
+chroot "$ROOTFS" chmod 664 \
+    "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
+
+echo "==> Installing the first-boot provisioning service"
+install -d -m 755 "$ROOTFS/opt/s3-gateway/firstboot"
+install -m 755 "$FIRSTBOOT_SRC/s3-gateway-firstboot.sh" "$ROOTFS/opt/s3-gateway/firstboot/s3-gateway-firstboot.sh"
+install -m 644 "$FIRSTBOOT_SRC/s3-gateway-firstboot.service" "$ROOTFS/etc/systemd/system/s3-gateway-firstboot.service"
+install -d -m 750 "$ROOTFS/var/lib/s3-gateway"
+chroot "$ROOTFS" chown "$SERVICE_USER:$SERVICE_USER" /var/lib/s3-gateway
+
+echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
+systemctl --root="$ROOTFS" enable "${SERVICE_NAME}.service"
+systemctl --root="$ROOTFS" enable s3-gateway-firstboot.service
+systemctl --root="$ROOTFS" enable postgresql.service
+systemctl --root="$ROOTFS" enable s3-gateway-log-maintenance.timer
+
+echo "==> customize90-s3-gateway complete"

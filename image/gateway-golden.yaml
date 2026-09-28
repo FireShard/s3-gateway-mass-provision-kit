@@ -1,0 +1,70 @@
+# Golden image config for S3 Zigbee Gateway Raspberry Pis.
+#
+# This bakes in everything that is IDENTICAL across every gateway you will
+# ever deploy: OS, packages, the s3gw service account, the app code + Python
+# venv, systemd units, sudoers/log-retention/GPS hardening, and a first-boot
+# provisioning service. The ONE thing every physical unit needs that this
+# image does NOT bake in is GATEWAY_ID (and, optionally, a site-specific
+# node inventory) - see image/firstboot/s3-gateway-firstboot.sh and
+# host/flash-and-provision.sh for how that gets applied per-card.
+#
+# Before building, run:
+#   ./rpi-image-gen layer --list
+# and set device.layer below to whatever matches the Pi model your fleet
+# actually uses (rpi4 / rpi5 / rpi-zero2w / etc - names depend on your
+# checkout's layer catalogue, so don't assume the value below is exactly
+# right for your version of the tool).
+
+# Pulls in the base Debian/systemd foundation (systemd, apt, networking,
+# etc.) that device/security layers like rpi-device-secpolicy require.
+# Without this, the build fails with "requires provider 'systemd'".
+layer:
+  base: trixie-minbase
+
+device:
+  user1: pi
+  user1pass: CHANGE-ME-BEFORE-BUILDING
+  layer: rpi3
+
+image:
+  layer: image-rpios
+  boot_part_size: 512M
+  root_part_size: 4096M
+
+ssh:
+  pubkey_user1: $(cat ${HOME}/.ssh/id_ed25519.pub)
+  pubkey_only: n
+
+# The base layer's own default locale is British English (GB keyboard,
+# Europe/London) - override to US here. Adjust timezone below if this
+# fleet isn't US Eastern; it only affects log timestamps until NTP is
+# reachable, but worth setting correctly for a sane audit trail.
+locale:
+  default: en_US.UTF-8
+  keyboard_keymap: us
+  keyboard_layout: English (US)
+  timezone: America/New_York
+
+packages:
+  - git
+  - rsync
+  - acl
+  - sudo
+  - usbutils
+  - python3
+  - python3-venv
+  - python3.13-venv
+  - python3-pip
+  - postgresql
+  - postgresql-client
+  - iproute2
+
+# These become shell environment variables inside the customize hooks
+# (image/hooks/customize90-s3-gateway), the same way the getting-started
+# guide's SSID/PSK example works.
+env:
+  S3_SERVICE_USER: s3gw
+  S3_TARGET_DIR: /opt/s3-gateway/app
+  S3_OPERATOR_USER: pi
+  S3_OPERATOR_DIR: /home/pi/S3Gateway
+  S3_DB_NAME: serial-gateway-program

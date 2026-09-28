@@ -1,0 +1,25 @@
+# ALTERNATIVE to first-boot provisioning: bake GATEWAY_ID directly into a
+# fully immutable per-unit image, using rpi-image-gen's own "include" layering
+# (this is the same pattern the official getting_started guide uses for
+# per-location images). Only worth it for small batches - see the trade-off
+# note in README.md before choosing this over host/flash-and-provision.sh.
+#
+# Usage:
+#   cp image/gateway-site-example.yaml image/gateway-s3-gw-03.yaml
+#   # edit env.GATEWAY_ID below to s3-gw-03
+#   ./rpi-image-gen build -S image/ -c image/gateway-s3-gw-03.yaml
+#   # repeat per unit with s3-gw-04, s3-gw-05, ...
+
+include:
+  file: gateway-golden.yaml
+
+device:
+  hostname: s3-gw-03
+
+env:
+  S3_SERVICE_USER: s3gw
+  S3_TARGET_DIR: /opt/s3-gateway/app
+  S3_OPERATOR_USER: pi
+  S3_OPERATOR_DIR: /home/pi/S3Gateway
+  S3_DB_NAME: serial-gateway-program
+  GATEWAY_ID: s3-gw-03

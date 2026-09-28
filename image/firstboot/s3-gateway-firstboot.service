@@ -1,0 +1,16 @@
+[Unit]
+Description=S3 Gateway one-time first-boot provisioning (GATEWAY_ID, DB, site files)
+ConditionPathExists=!/var/lib/s3-gateway/.provisioned
+After=postgresql.service local-fs.target
+Requires=postgresql.service
+Before=s3-zigbee-gateway.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/s3-gateway/firstboot/s3-gateway-firstboot.sh
+# Retry on the next boot if the card wasn't provisioned yet / dbup failed.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

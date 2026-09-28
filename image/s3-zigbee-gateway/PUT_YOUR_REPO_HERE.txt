@@ -1,0 +1,19 @@
+Unzip your existing s3-zigbee-gateway.zip so that this directory contains
+its contents directly, e.g.:
+
+  unzip s3-zigbee-gateway.zip -d /tmp/x
+  rsync -a --exclude=.git/ /tmp/x/s3-zigbee-gateway/ image/s3-zigbee-gateway/
+  rm PUT_YOUR_REPO_HERE.txt
+
+You should end up with:
+  image/s3-zigbee-gateway/requirements.txt
+  image/s3-zigbee-gateway/PYSerialGateway/
+  image/s3-zigbee-gateway/pyserialgateway/
+  image/s3-zigbee-gateway/deploy/
+  image/s3-zigbee-gateway/scripts/
+  image/s3-zigbee-gateway/.env.example
+  ...
+
+The build hook (image/hooks/customize90-s3-gateway) reads this tree and
+copies it into the image, so it must be the real application source, not
+this placeholder.
