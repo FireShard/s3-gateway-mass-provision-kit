@@ -453,7 +453,7 @@ function Write-ImageToDisk {
     param([string]$ImagePath, $Disk)
     Initialize-RawDiskType
     $sector = [Math]::Max(512, [int]$Disk.LogicalSectorSize)
-    $total  = (Get-Item -LiteralPath $ImagePath).Length
+    $total  = [long](Get-Item -LiteralPath $ImagePath).Length
     $buf    = New-Object byte[] $script:ChunkBytes
     $act    = "Writing image to Disk $($Disk.Number)"
     $src    = [IO.File]::OpenRead($ImagePath)
@@ -490,7 +490,7 @@ function Write-ImageToDisk {
 
             if (($sw.ElapsedMilliseconds - $lastUi) -ge 1000) {
                 $lastUi = $sw.ElapsedMilliseconds
-                $pct = [int][Math]::Min(100, ($done * 100) / [Math]::Max(1, $total))
+                $pct = [int][Math]::Min([double]100, ([double]$done * 100) / [Math]::Max([double]1, [double]$total))
                 $mbps = ($done / 1MB) / [Math]::Max(0.001, $sw.Elapsed.TotalSeconds)
                 Write-Progress -Activity $act -Status ('{0:N0} of {1:N0} MB  ({2:N1} MB/s)' -f ($done / 1MB), ($total / 1MB), $mbps) -PercentComplete $pct
             }
