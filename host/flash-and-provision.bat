@@ -4,7 +4,9 @@ rem  Launcher for flash-and-provision.ps1 (Windows version of
 rem  host/flash-and-provision.sh). Keep both files in the same folder.
 rem
 rem  DOUBLE-CLICK this file: Windows asks for Administrator rights (needed
-rem  to write to the SD card), then the script asks for what it needs.
+rem  to write to the SD card), then the guided wizard starts (same flow as
+rem  the Linux flash wizard: flash cards one at a time, batch from a CSV,
+rem  change a Gateway ID, show the log).
 rem
 rem  Advanced: from an Administrator Command Prompt, pass options:
 rem     flash-and-provision.bat -Image D:\golden.img -DiskNumber 2 -GatewayId s3-gw-03
