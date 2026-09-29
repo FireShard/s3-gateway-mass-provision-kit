@@ -1,13 +1,5 @@
 gateway_id,site,notes
-s3-gw-03,Seputeh,replacement for damaged unit
-s3-gw-04,Seputeh,new pole run
-s3-gw-05,Cheras,
-s3-gw-06,Cheras,
-
-# "site" is only used if you pass --site-files-root to flash-and-provision.sh,
-# e.g. --site-files-root site-files/ with:
-#   site-files/Seputeh/samplelist.csv
-#   site-files/Seputeh/pygw_conf.py
-#   site-files/siteA/required-siteAgw.zip
-# Leave "site" empty to keep whatever samplelist.csv/pygw_conf.py is already
-# baked into the golden image's operator workspace.
+s3-gw-03,Seputeh 
+s3-gw-04,Seputeh 
+s3-gw-05,Cheras 
+s3-gw-06,Cheras 
