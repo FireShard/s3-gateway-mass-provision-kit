@@ -108,8 +108,8 @@ Use this when you have many cards to make. First create a file such as `gateways
 
 ```
 gateway_id,site,notes
-s3-gw-01,siteA,Kitchen
-s3-gw-02,siteA,Garage
+s3-gw-01,siteA,Maintainence
+s3-gw-02,siteA,Broken Pole
 s3-gw-03,siteB,
 s3-gw-04,,no site files
 ```
@@ -141,9 +141,205 @@ Every card is recorded in `flash-log.csv` (in the `host` folder on Linux, next t
 
 If a card shows **INCOMPLETE**, it failed or was cancelled. **Do not use that card** until it has been flashed again successfully.
 
+
 ---
 
-## 4. Wizard options
+## 4. After flashing: install the card and start the gateway
+
+Flashing and provisioning prepare the SD card. The **next step is to put the card into the Raspberry Pi and let the gateway finish its setup on first boot**.
+
+### Step 1 — Label and install the SD card
+
+Before leaving the provisioning PC:
+
+1. Make sure the wizard says:
+   ```text
+   DONE - card for <Gateway ID> is ready
+   ```
+2. Wait for the SD card reader light to stop blinking.
+3. Remove the SD card.
+4. **Label the card with its Gateway ID.**
+5. Insert the card into the Raspberry Pi assigned to that Gateway ID.
+6. Connect the correct Zigbee USB gateway.
+7. Connect the network.
+8. Power on the Raspberry Pi.
+
+> The Gateway ID is also used as the gateway hostname.
+
+For example:
+
+```text
+Gateway ID: s3-gw-03
+Hostname:   s3-gw-03
+```
+
+### Step 2 — Let first boot finish
+
+Do not immediately interrupt the Pi after power-on.
+
+On the first boot, the gateway reads the provisioning information written by the flashing wizard and performs the remaining setup.
+
+It:
+
+1. Sets the `GATEWAY_ID`.
+2. Sets the hostname to the Gateway ID.
+3. Applies any MQTT settings supplied during provisioning.
+4. Installs the site files, if any were provided.
+5. Creates the PostgreSQL role/database/schema if needed.
+6. Runs `s3-gateway-dbup`.
+7. Starts the gateway service.
+8. Marks the Pi as provisioned so the first-boot setup does not run again.
+
+Allow the Pi enough time to complete this first boot before starting the verification steps.
+
+### Step 3 — Find the gateway on the network
+
+The hostname should be the Gateway ID.
+
+For example:
+
+```text
+s3-gw-03
+```
+
+Try:
+
+```bash
+ssh pi@s3-gw-03
+```
+
+
+If `.local` does not resolve, find the Pi's IP address from your network/DHCP list and connect using:
+
+```bash
+ssh pi@<gateway-ip>
+```
+
+### Step 4 — launch the gateway service and check that the gateway service is running
+
+After logging in:
+
+```bash
+sudo s3-gateway-dbup
+```
+The expected result is:
+
+```text
+DBUP: PASS
+
+Starting production gateway...
+```
+The command should end and sned back the user to the terminal console after outputing `Starting production gateway...`
+
+Then:
+
+```bash
+sudo systemctl is-active s3-zigbee-gateway
+```
+
+The expected result is:
+
+```text
+active
+```
+
+If it is active, the main gateway service is running.
+
+### Step 5 — Run the gateway validation
+
+Run the project's validation script:
+
+```bash
+sudo bash /opt/s3-gateway/app/scripts/validate-handover.sh
+```
+
+Review the output for any failures.
+
+This is the main post-installation check before handing the gateway over for use.
+
+### Step 6 — Check the first-boot log if something went wrong
+
+If the service is not running or the configuration is not correct, check the first-boot log:
+
+```bash
+journalctl -t s3-gateway-firstboot
+```
+
+For more detail about the validation performed during first boot:
+
+```bash
+journalctl -t s3-gateway-firstboot.validate
+```
+
+You can also check the gateway service:
+
+```bash
+sudo systemctl status s3-zigbee-gateway
+```
+
+### Step 7 — Confirm site files, if used
+
+If you selected a site during flashing, the first-boot process should have installed the supplied files.
+
+Check:
+
+```bash
+ls -l /home/pi/S3Gateway/samplelist.csv
+ls -l /home/pi/S3Gateway/pygw_conf.py
+```
+
+If a `required-*gw.zip` package was supplied, check:
+
+```bash
+ls -l /opt/s3-gateway/app/pyserialgateway/
+```
+
+The first-boot log should also show which site files were installed:
+
+```bash
+journalctl -t s3-gateway-firstboot
+```
+
+### Step 8 — Final handover check
+
+A gateway is ready for handover when:
+
+- The correct Gateway ID is configured.
+- The hostname matches the Gateway ID.
+- The gateway can be reached over the network.
+- `s3-zigbee-gateway` is **active**.
+- `validate-handover.sh` completes successfully.
+- The correct site files are present, if applicable.
+- The correct Zigbee USB gateway is connected.
+
+Record the completed Gateway ID in your batch/provisioning records.
+
+---
+
+## Quick post-flashing checklist
+
+Use this checklist for every gateway:
+
+```text
+[ ] SD card labelled with Gateway ID
+[ ] SD card inserted into the correct Raspberry Pi
+[ ] Correct Zigbee USB gateway connected
+[ ] Network connected
+[ ] Pi powered on
+[ ] First-boot setup completed
+[ ] SSH connection works
+[ ] Hostname matches Gateway ID
+[ ] s3-zigbee-gateway is active
+[ ] validate-handover.sh passes
+[ ] Site files verified (if applicable)
+[ ] Gateway recorded as completed
+```
+
+> **Important:** A card being successfully flashed does not by itself mean the gateway is ready for use. Always complete the first-boot and verification steps above.
+
+---
+
+## 5. Wizard options
 
 You normally do not need these.
 
@@ -259,7 +455,7 @@ sudo ./host/flash-and-provision.sh --device /dev/sdb --gateway-id s3-gw-07 --no-
 
 ---
 
-## 6. Site files
+## 7. Site files
 
 A site folder can hold any of these files. They are copied to the card next to the Gateway ID:
 
@@ -273,7 +469,7 @@ You do not need all three. Anything missing keeps the default that is already bu
 
 ---
 
-## 7. Gateway ID rules
+## 8. Gateway ID rules
 
 The Gateway ID becomes the gateway's **hostname**, so:
 
@@ -285,7 +481,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 
 ---
 
-## 8. Safety notes
+## 9. Safety notes
 
 - **Everything on the SD card is erased** when you flash it. Double-check the size and name shown before you confirm.
 - The tools refuse to touch your system disk. `-AllowNonRemovable` removes part of that protection on Windows, so use it only if you fully understand which disk you are choosing.
@@ -295,7 +491,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Problem | What to do |
 |---|---|
@@ -306,7 +502,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 | **"CHECKSUM MISMATCH"** | The image is damaged or is not the approved one. Download or copy it again. |
 | **"Looks like a compressed file"** | Extract the `.xz` / `.zip` / `.gz` first so you have a plain `.img` file. |
 | **"Does not look like a Raspberry Pi disk image"** | Wrong file. Choose the golden `.img`. |
-| **"Gateway ID ... not valid"** | See section 7. |
+| **"Gateway ID ... not valid"** | See section 8. |
 | **"ID was already flashed"** | Each gateway needs a unique ID. Only answer yes if you are deliberately re-making that same card. |
 | **Site folder rejected** | It has none of `samplelist.csv`, `pygw_conf.py`, `required-*gw.zip`, or the name is misspelled. |
 | **Windows: "You need to format the disk"** after flashing | Click **Cancel**. That is normal for a Raspberry Pi card. |
