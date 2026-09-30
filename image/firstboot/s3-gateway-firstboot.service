@@ -9,6 +9,9 @@ Before=s3-zigbee-gateway.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/s3-gateway/firstboot/s3-gateway-firstboot.sh
+# Type=oneshot has NO start timeout by default, so a hang here would hold
+# multi-user.target (and the gateway, ordered After= us) forever. Fail instead.
+TimeoutStartSec=600
 # Retry on the next boot if the card wasn't provisioned yet / dbup failed.
 Restart=no
 

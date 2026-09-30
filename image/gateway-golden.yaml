@@ -2,11 +2,12 @@
 #
 # This bakes in everything that is IDENTICAL across every gateway you will
 # ever deploy: OS, packages, the s3gw service account, the app code + Python
-# venv, systemd units, sudoers/log-retention/GPS hardening, and a first-boot
-# provisioning service. The ONE thing every physical unit needs that this
-# image does NOT bake in is GATEWAY_ID (and, optionally, a site-specific
-# node inventory) - see image/firstboot/s3-gateway-firstboot.sh and
-# host/flash-and-provision.sh for how that gets applied per-card.
+# venv, systemd units, sudoers/log-retention/GPS hardening, the local web admin
+# (port 8080), and a first-boot provisioning service. The ONE thing every
+# physical unit needs that this image does NOT bake in is GATEWAY_ID (and,
+# optionally, a site-specific node inventory) - see
+# image/firstboot/s3-gateway-firstboot.sh and host/flash-and-provision.sh for
+# how that gets applied per-card.
 #
 # Before building, run:
 #   ./rpi-image-gen layer --list
@@ -58,6 +59,9 @@ packages:
   - postgresql
   - postgresql-client
   - iproute2
+  - minicom
+  # Wi-Fi supplicant only; NetworkManager/nmtui are intentionally NOT installed.
+  - wpasupplicant
 
 # These become shell environment variables inside the customize hooks
 # (image/hooks/customize90-s3-gateway), the same way the getting-started
@@ -68,3 +72,8 @@ env:
   S3_OPERATOR_USER: pi
   S3_OPERATOR_DIR: /home/pi/S3Gateway
   S3_DB_NAME: serial-gateway-program
+  # Login password for the local web admin (http://<gateway>:8080/). Same for
+  # every unit built from this image, like the pi password above. The hook
+  # refuses to build if this is unset, under 8 characters, or left as the
+  # placeholder. Only its hash is stored in the image.
+  S3_WEBADMIN_PASSWORD: CHANGE-ME-BEFORE-BUILDING

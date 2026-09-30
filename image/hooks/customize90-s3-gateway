@@ -11,6 +11,13 @@
 #   - install a site's samplelist.csv / pygw_conf.py
 #   - run s3-gateway-dbup
 # Those all happen at first boot instead - see image/firstboot/.
+#
+# The local web admin (webadmin/ in the app source) IS installed here, mirroring
+# scripts/install-webadmin.sh. That script can't run in a build chroot as-is
+# (it prompts for a password and needs a live systemctl), so its steps are done
+# offline instead: the login password comes from S3_WEBADMIN_PASSWORD in
+# gateway-golden.yaml, and the per-unit cookie-signing key is generated on the
+# unit's first start (see s3-gateway-webadmin-initkey below).
 set -euo pipefail
 
 ROOTFS="$1"
@@ -29,6 +36,39 @@ if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
     echo "ERROR: $SRC does not look like the s3-zigbee-gateway source tree." >&2
     echo "Unzip your s3-zigbee-gateway.zip into image/s3-zigbee-gateway/ first." >&2
     echo "See image/s3-zigbee-gateway/PUT_YOUR_REPO_HERE.txt" >&2
+    exit 1
+fi
+
+# --- first-boot pre-flight: the bundled dbup MUST honor S3_DBUP_SKIP_RESTART ---
+# s3-gateway-firstboot.service is ordered Before= the gateway service. If dbup
+# calls `systemctl start s3-zigbee-gateway` from inside it, that start job waits
+# for first-boot to finish while first-boot waits for the start: a permanent
+# systemd job deadlock (`systemctl list-jobs` shows firstboot "running" forever
+# and multi-user.target "waiting"). Refuse to build an image that has it.
+if ! grep -q 'S3_DBUP_SKIP_RESTART' "$SRC/scripts/s3-gateway-dbup"; then
+    echo "ERROR: $SRC/scripts/s3-gateway-dbup does not support S3_DBUP_SKIP_RESTART." >&2
+    echo "Booting an image with it deadlocks systemd (first-boot <-> gateway start job)." >&2
+    echo "Re-sync image/s3-zigbee-gateway/ from the patched source tree." >&2
+    exit 1
+fi
+
+# --- web admin pre-flight: fail here, in seconds, not after the apt/pip steps ---
+WEBADMIN_SERVICE="s3-gateway-webadmin"
+for f in webadmin/app.py \
+         deploy/systemd/s3-gateway-webadmin.service \
+         deploy/sudoers/s3-gateway-webadmin \
+         deploy/webadmin.env.example; do
+    if [ ! -e "$SRC/$f" ]; then
+        echo "ERROR: $SRC/$f is missing." >&2
+        echo "image/s3-zigbee-gateway/ does not contain the web admin - re-sync it from the current source tree." >&2
+        exit 1
+    fi
+done
+
+WEBADMIN_PASSWORD="${S3_WEBADMIN_PASSWORD:-}"
+if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFORE-BUILDING" ]; then
+    echo "ERROR: S3_WEBADMIN_PASSWORD is unset, shorter than 8 characters, or still the placeholder." >&2
+    echo "Set env.S3_WEBADMIN_PASSWORD in image/gateway-golden.yaml (this is the web admin login for every unit built from the image)." >&2
     exit 1
 fi
 
@@ -51,7 +91,13 @@ chroot "$ROOTFS" apt-get update
 chroot "$ROOTFS" apt-get install -y \
     git rsync acl sudo usbutils iproute2 \
     python3 python3-venv python3.13-venv python3-pip \
-    postgresql postgresql-client
+    postgresql postgresql-client \
+    minicom
+
+# ModemManager probes USB serial ports with AT commands and can corrupt traffic
+# to the Zigbee module. Nothing in this image installs it; masking is cheap
+# insurance against a future package pulling it in.
+systemctl --root="$ROOTFS" mask ModemManager.service
 
 echo "==> Copying application source into $ROOTFS$TARGET_DIR"
 install -d -m 755 "$ROOTFS$TARGET_DIR"
@@ -71,6 +117,8 @@ chroot "$ROOTFS" bash -c "
 set -euo pipefail
 id '$SERVICE_USER' >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin '$SERVICE_USER'
 usermod -a -G dialout '$SERVICE_USER'
+# minicom (installed above) needs serial-port access for the operator login too.
+usermod -a -G dialout '$OPERATOR_USER'
 python3 -m venv '$TARGET_DIR/.venv'
 '$TARGET_DIR/.venv/bin/pip' install --upgrade pip
 '$TARGET_DIR/.venv/bin/pip' install -r '$TARGET_DIR/requirements.txt'
@@ -114,12 +162,11 @@ install -d -m 755 "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d"
 install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
     "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d/override.conf"
 # NOTE: s3-gateway-firstboot.service declares "Before=${SERVICE_NAME}.service"
-# (ordering only, no Requires=) so the two can't form a startup dependency
-# cycle - s3-gateway-dbup itself calls `systemctl start` on this unit from
-# inside the first-boot script. On the very first boot only, the gateway may
-# start once with GATEWAY_ID=UNPROVISIONED / no DB yet and crash-loop for a
-# few seconds (Restart=on-failure already handles this) until first-boot
-# finishes and cleanly restarts it. This is expected and self-healing.
+# (ordering only, no Requires=), so the gateway is held back until first-boot
+# has written GATEWAY_ID and initialised the DB, then starts by itself. The
+# first-boot script runs s3-gateway-dbup with S3_DBUP_SKIP_RESTART=1 so dbup
+# never runs `systemctl stop/start` on the gateway from inside the unit that
+# is ordered Before= it (that deadlocks systemd - see the pre-flight above).
 
 install -m 440 "$SRC/deploy/sudoers/s3-gateway-hwreset" "$ROOTFS/etc/sudoers.d/s3-gateway-hwreset"
 chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-hwreset
@@ -193,8 +240,79 @@ install -m 644 "$FIRSTBOOT_SRC/s3-gateway-firstboot.service" "$ROOTFS/etc/system
 install -d -m 750 "$ROOTFS/var/lib/s3-gateway"
 chroot "$ROOTFS" chown "$SERVICE_USER:$SERVICE_USER" /var/lib/s3-gateway
 
+echo "==> Installing the local web admin (${WEBADMIN_SERVICE})"
+# The webadmin/ package and its Python deps (Flask, waitress) are already in the
+# image from the rsync + pip steps above. What's left is what install-webadmin.sh
+# does: env file, sudo rule, systemd unit.
+WEBADMIN_ENV="/etc/s3-gateway/webadmin.env"
+
+# The service runs as the operator account, which must be able to read the package.
+chroot "$ROOTFS" chown -R root:"$SERVICE_USER" "$TARGET_DIR/webadmin"
+chroot "$ROOTFS" chmod -R go+rX,go-w "$TARGET_DIR/webadmin"
+
+# Same import check install-webadmin.sh runs: catches a missing dependency now
+# rather than as a crash-looping service on the unit.
+chroot "$ROOTFS" env PYTHONDONTWRITEBYTECODE=1 "$TARGET_DIR/.venv/bin/python" \
+    -c "import sys; sys.path.insert(0, '$TARGET_DIR'); import webadmin.app"
+
+# Hash the build-time password with the image's own Werkzeug (what the app
+# verifies with). Passed on stdin so it never appears in a process list or needs
+# shell quoting.
+WEBADMIN_HASH="$(printf '%s' "$WEBADMIN_PASSWORD" | chroot "$ROOTFS" env PYTHONDONTWRITEBYTECODE=1 \
+    "$TARGET_DIR/.venv/bin/python" -c \
+    'import sys; from werkzeug.security import generate_password_hash; print(generate_password_hash(sys.stdin.read()))')"
+case "$WEBADMIN_HASH" in
+    *'$'*'$'*) ;;   # werkzeug hashes look like  method:params$salt$digest
+    *) echo "ERROR: could not generate the web admin password hash" >&2; exit 1 ;;
+esac
+
+install -d -m 755 "$ROOTFS/etc/s3-gateway"
+install -m 600 "$SRC/deploy/webadmin.env.example" "$ROOTFS$WEBADMIN_ENV"
+chroot "$ROOTFS" chown root:root "$WEBADMIN_ENV"
+sed -i "s|^S3_WEBADMIN_PASSWORD_HASH=.*|S3_WEBADMIN_PASSWORD_HASH=${WEBADMIN_HASH}|" "$ROOTFS$WEBADMIN_ENV"
+grep -qxF "S3_WEBADMIN_PASSWORD_HASH=${WEBADMIN_HASH}" "$ROOTFS$WEBADMIN_ENV" \
+    || { echo "ERROR: failed to write the web admin password hash into $WEBADMIN_ENV" >&2; exit 1; }
+# S3_WEBADMIN_SECRET_KEY is deliberately left empty here: the login cookies are
+# signed with it, so a key baked into a shared golden image would let anyone who
+# has the image forge a logged-in session on every gateway. Each unit generates
+# its own on first start instead.
+cat > "$ROOTFS/usr/local/sbin/s3-gateway-webadmin-initkey" <<'EOF'
+#!/bin/bash
+# Gives this gateway its own web admin cookie-signing key (no-op once set).
+set -euo pipefail
+ENV_FILE=/etc/s3-gateway/webadmin.env
+grep -q '^S3_WEBADMIN_SECRET_KEY=' "$ENV_FILE" || echo 'S3_WEBADMIN_SECRET_KEY=' >> "$ENV_FILE"
+if grep -q '^S3_WEBADMIN_SECRET_KEY=.\+' "$ENV_FILE"; then
+    exit 0
+fi
+KEY="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+sed -i "s|^S3_WEBADMIN_SECRET_KEY=.*|S3_WEBADMIN_SECRET_KEY=${KEY}|" "$ENV_FILE"
+EOF
+chmod 755 "$ROOTFS/usr/local/sbin/s3-gateway-webadmin-initkey"
+
+# The only privilege the web admin gets: passwordless sudo for s3-gateway-dbup
+# (its "Apply" button). Same rule and validation as install-webadmin.sh.
+sed "s|__OPERATOR_USER__|${OPERATOR_USER}|g" "$SRC/deploy/sudoers/s3-gateway-webadmin" \
+    > "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
+chmod 440 "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
+chroot "$ROOTFS" chown root:root /etc/sudoers.d/s3-gateway-webadmin
+chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-webadmin
+
+sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__OPERATOR_DIR__|${OPERATOR_DIR}|g" \
+    "$SRC/deploy/systemd/s3-gateway-webadmin.service" \
+    > "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service"
+chmod 644 "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service"
+# Drop-in (rather than editing the project's unit): systemd re-reads
+# EnvironmentFile after ExecStartPre, and "+" runs it as root despite User=.
+install -d -m 755 "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service.d"
+cat > "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service.d/10-initkey.conf" <<'EOF'
+[Service]
+ExecStartPre=+/usr/local/sbin/s3-gateway-webadmin-initkey
+EOF
+
 echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
 systemctl --root="$ROOTFS" enable "${SERVICE_NAME}.service"
+systemctl --root="$ROOTFS" enable "${WEBADMIN_SERVICE}.service"
 systemctl --root="$ROOTFS" enable s3-gateway-firstboot.service
 systemctl --root="$ROOTFS" enable postgresql.service
 systemctl --root="$ROOTFS" enable s3-gateway-log-maintenance.timer

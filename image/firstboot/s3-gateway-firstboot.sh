@@ -218,6 +218,9 @@ fi
 # After=/Before=-ordered against this very unit, so calling `systemctl start`
 # on it from inside our own still-running ExecStart would deadlock; systemd
 # starts it automatically the moment this script (and this unit) finishes.
+# (dbup must honor S3_DBUP_SKIP_RESTART - the image build refuses to proceed
+# if the bundled copy does not.) Never add a synchronous `systemctl start/
+# stop/restart s3-zigbee-gateway` to this script; use --no-block if ever needed.
 log "Running s3-gateway-dbup"
 if S3_DBUP_SKIP_RESTART=1 /usr/local/sbin/s3-gateway-dbup; then
     log "s3-gateway-dbup: PASS"
@@ -232,7 +235,12 @@ log "Provisioning complete for $GATEWAY_ID"
 
 # Optional QA trail: run the project's own read-only acceptance check and
 # log the result (does not fail this unit on WARN/FAIL - it's informational).
+# It checks that the gateway is ACTIVE, which is impossible while this unit is
+# still running (the gateway is ordered After= us), so run it shortly after we
+# exit, as a detached transient unit, instead of inline.
 if [ -x "$TARGET_DIR/scripts/validate-handover.sh" ]; then
-    log "Running validate-handover.sh for the QA trail"
-    bash "$TARGET_DIR/scripts/validate-handover.sh" 2>&1 | logger -t "$LOG_TAG.validate" || true
+    log "Scheduling validate-handover.sh (60s after first-boot) for the QA trail"
+    systemd-run --no-block --quiet --on-active=60 --unit=s3-gateway-firstboot-validate \
+        /bin/bash -c "bash '$TARGET_DIR/scripts/validate-handover.sh' 2>&1 | logger -t '$LOG_TAG.validate'" \
+        || log "WARNING: could not schedule validate-handover.sh"
 fi
