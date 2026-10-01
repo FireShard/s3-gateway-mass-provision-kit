@@ -257,6 +257,32 @@ namespace S3Gw
 '@
 }
 
+function Get-Win32Code {
+    # Native Windows error code buried inside a (possibly wrapped) exception, or 0.
+    param([Exception]$Ex)
+    $e = $Ex
+    while ($e -and -not ($e -is [System.ComponentModel.Win32Exception]) -and $e.InnerException) { $e = $e.InnerException }
+    if ($e -is [System.ComponentModel.Win32Exception]) { return [int]$e.NativeErrorCode }
+    return 0
+}
+
+function Set-DiskWritable {
+    # Brings the disk online and writable (a freshly cleared card can drop offline) and
+    # waits up to ~10 s until Windows reports it that way. Returns $true when it is.
+    param([int]$Number)
+    for ($i = 0; $i -lt 10; $i++) {
+        try { Update-Disk -Number $Number -ErrorAction Stop | Out-Null } catch { }
+        $d = Get-DiskOrNull -Number $Number
+        if (-not $d) { Start-Sleep -Seconds 1; continue }
+        if ($d.IsOffline)  { try { Set-Disk -Number $Number -IsOffline $false -ErrorAction Stop } catch { } }
+        if ($d.IsReadOnly) { try { Set-Disk -Number $Number -IsReadOnly $false -ErrorAction Stop } catch { } }
+        $d = Get-DiskOrNull -Number $Number
+        if ($d -and (-not $d.IsOffline) -and (-not $d.IsReadOnly) -and ($d.Size -gt 0)) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
 function Get-DiskWriteHint {
     # Turns a raw Win32 failure into something an operator can act on.
     param([Exception]$Ex)
@@ -272,6 +298,12 @@ function Get-DiskWriteHint {
     }
     if ($code -eq 32 -or $code -eq 33) {
         return "Another program is using the card (an Explorer window, Raspberry Pi Imager, antivirus...). Close it and try again. ($($e.Message))"
+    }
+    if ($code -eq 21) {
+        return "Windows says the card is 'not ready' even after bringing it online. Unplug the card reader, plug it into a different USB port (directly into the PC, not a hub), re-insert the card and try again. If it still fails, try another card reader; if a different reader fails the same way, the SD card itself is probably faulty - replace it. ($($e.Message))"
+    }
+    if ($code -eq 1117 -or $code -eq 23) {
+        return "The card or reader reported a hardware error while writing. Try another USB port or card reader; if it repeats, the SD card is probably failing - replace it. ($($e.Message))"
     }
     return $Ex.Message
 }
@@ -435,9 +467,7 @@ function Clear-CardDisk {
     # so drop the old partition table first (this also unmounts the volumes).
     param($Disk)
     $n = $Disk.Number
-    $d = Get-DiskOrNull -Number $n
-    if ($d -and $d.IsOffline)  { try { Set-Disk -Number $n -IsOffline $false -ErrorAction Stop } catch { } }
-    if ($d -and $d.IsReadOnly) { try { Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop } catch { } }
+    [void](Set-DiskWritable -Number $n)
     try {
         Clear-Disk -Number $n -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
     } catch {
@@ -447,6 +477,11 @@ function Clear-CardDisk {
         }
     }
     Start-Sleep -Seconds 1
+    # Clearing can leave the disk offline, and Windows refuses raw writes to an offline disk
+    # with "The device is not ready" - so make sure it is online and writable before writing.
+    if (-not (Set-DiskWritable -Number $n)) {
+        Write-Warn "Disk $n is still not online/writable after clearing; trying to write anyway."
+    }
 }
 
 function Write-ImageToDisk {
@@ -482,8 +517,25 @@ function Write-ImageToDisk {
                 $count = $filled + ($sector - $rem)
                 [Array]::Clear($buf, $filled, $count - $filled)
             }
-            try { [S3Gw.RawDisk]::Write($h, $buf, $count) }
-            catch { throw (Get-DiskWriteHint -Ex $_.Exception) }
+            $attempt = 0
+            while ($true) {
+                try { [S3Gw.RawDisk]::Write($h, $buf, $count); break }
+                catch {
+                    $ex = $_.Exception
+                    $attempt++
+                    # Only the very first chunk is retried (the write position is certainly still 0 there).
+                    if ((Get-Win32Code -Ex $ex) -eq 21 -and $done -eq 0 -and $attempt -le 3) {
+                        Write-Warn "Windows says the card is not ready (try $attempt of 3) - bringing it online and retrying..."
+                        [void](Set-DiskWritable -Number ([int]$Disk.Number))
+                        Start-Sleep -Seconds 3
+                        $h.Dispose()
+                        try { $h = [S3Gw.RawDisk]::OpenForWrite([int]$Disk.Number) }
+                        catch { throw (Get-DiskWriteHint -Ex $_.Exception) }
+                        continue
+                    }
+                    throw (Get-DiskWriteHint -Ex $ex)
+                }
+            }
             $done += $filled
             $sinceFlush += $count
             if ($sinceFlush -ge $script:FlushEveryBytes) { [S3Gw.RawDisk]::Flush($h); $sinceFlush = 0 }
