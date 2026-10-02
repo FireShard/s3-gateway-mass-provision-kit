@@ -18,6 +18,12 @@
 # offline instead: the login password comes from S3_WEBADMIN_PASSWORD in
 # gateway-golden.yaml, and the per-unit cookie-signing key is generated on the
 # unit's first start (see s3-gateway-webadmin-initkey below).
+#
+# The log policy (scripts/install-log-retention.sh) is likewise installed offline:
+#   00:00 daily  s3-gateway-log-rotate.timer       new gateway.log / mqtt.log / error.log
+#                                                  (config: /etc/s3-gateway/logrotate.conf)
+#   09:00 daily  s3-gateway-log-maintenance.timer  gzip rotated logs > 7 days, delete > 3 months
+# Midnight / 09:00 are the unit's local time, i.e. locale.timezone in gateway-golden.yaml.
 set -euo pipefail
 
 ROOTFS="$1"
@@ -65,6 +71,18 @@ for f in webadmin/app.py \
     fi
 done
 
+# --- log retention pre-flight: same idea ---
+for f in scripts/log-maintenance.sh \
+         deploy/systemd/s3-gateway-log-rotate.service \
+         deploy/systemd/s3-gateway-log-rotate.timer \
+         deploy/systemd/s3-gateway-log-maintenance.timer; do
+    if [ ! -e "$SRC/$f" ]; then
+        echo "ERROR: $SRC/$f is missing." >&2
+        echo "image/s3-zigbee-gateway/ does not contain the log retention service - re-sync it from the current source tree." >&2
+        exit 1
+    fi
+done
+
 WEBADMIN_PASSWORD="${S3_WEBADMIN_PASSWORD:-}"
 if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFORE-BUILDING" ]; then
     echo "ERROR: S3_WEBADMIN_PASSWORD is unset, shorter than 8 characters, or still the placeholder." >&2
@@ -89,7 +107,7 @@ echo "==> Ensuring required packages are installed"
 # install later is a harmless no-op ("already the newest version").
 chroot "$ROOTFS" apt-get update
 chroot "$ROOTFS" apt-get install -y \
-    git rsync acl sudo usbutils iproute2 \
+    git rsync acl sudo usbutils iproute2 logrotate \
     python3 python3-venv python3.13-venv python3-pip \
     postgresql postgresql-client \
     minicom
@@ -156,7 +174,7 @@ S3_OPERATOR_HOME=/home/$OPERATOR_USER
 S3_OPERATOR_DIR=$OPERATOR_DIR
 EOF
 
-echo "==> Installing systemd units, GPSUP override, sudoers, logrotate, dbup wrapper"
+echo "==> Installing systemd units, GPSUP override, sudoers, dbup wrapper"
 install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway.service" "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service"
 install -d -m 755 "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d"
 install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
@@ -171,24 +189,68 @@ install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
 install -m 440 "$SRC/deploy/sudoers/s3-gateway-hwreset" "$ROOTFS/etc/sudoers.d/s3-gateway-hwreset"
 chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-hwreset
 
-install -d -m 755 "$ROOTFS/etc/logrotate.d"
-sed "s#/home/pi/S3Gateway#${OPERATOR_DIR}#g" "$SRC/deploy/logrotate/s3-gateway" \
-    > "$ROOTFS/etc/logrotate.d/s3-gateway"
-
 install -m 755 "$SRC/scripts/s3-gateway-dbup" "$ROOTFS/usr/local/sbin/s3-gateway-dbup"
+
+echo "==> Installing the log policy (mirrors install-log-retention.sh): midnight rotation + 09:00 retention"
+# Rotation config. Deliberately NOT in /etc/logrotate.d/: the distro's own daily
+# logrotate job would then rotate these files a second time, at a different hour.
+# Same content as install-log-retention.sh writes; "su" matches the ownership set
+# on the log dir/files further down (operator user, service group).
+rm -f "$ROOTFS/etc/logrotate.d/s3-gateway"
+install -d -m 755 "$ROOTFS/etc/s3-gateway" "$ROOTFS/var/lib/logrotate"
+cat > "$ROOTFS/etc/s3-gateway/logrotate.conf" <<EOF
+# Written by customize90-s3-gateway. Run by s3-gateway-log-rotate.timer at 00:00:00.
+${OPERATOR_DIR}/log/gateway.log
+${OPERATOR_DIR}/log/error.log
+${OPERATOR_DIR}/log/mqtt.log {
+    daily
+    missingok
+    notifempty
+    rotate 365
+    dateext
+    dateyesterday
+    dateformat .%Y-%m-%d
+    nocompress
+    copytruncate
+    su ${OPERATOR_USER} ${SERVICE_USER}
+}
+EOF
+chmod 644 "$ROOTFS/etc/s3-gateway/logrotate.conf"
+
+# Seed logrotate's state file with an old "last rotated" date for each log. Without
+# this, the unit's FIRST run only records today's date and rotates nothing (logrotate
+# treats a file it has never seen as "just rotated"), so the first midnight passes
+# with no new log file. With it, the first 00:00 run rotates properly. The state file
+# is rewritten by logrotate itself on every run.
+{
+    echo "logrotate state -- version 2"
+    for log in gateway error mqtt; do
+        echo "\"${OPERATOR_DIR}/log/${log}.log\" 2000-1-1-0:0:0"
+    done
+} > "$ROOTFS/var/lib/logrotate/s3-gateway.status"
+chmod 640 "$ROOTFS/var/lib/logrotate/s3-gateway.status"
+
 install -m 755 "$SRC/scripts/log-maintenance.sh" "$ROOTFS/usr/local/sbin/s3-gateway-log-maintenance"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.service" \
+    "$ROOTFS/etc/systemd/system/s3-gateway-log-rotate.service"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.timer" \
+    "$ROOTFS/etc/systemd/system/s3-gateway-log-rotate.timer"
 install -m 644 "$SRC/deploy/systemd/s3-gateway-log-maintenance.timer" \
     "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.timer"
+# Generated rather than copied: the repo's unit hard-codes /home/pi/S3Gateway/log.
 cat > "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service" <<EOF
 [Unit]
-Description=S3 Gateway log retention maintenance
+Description=S3 Gateway log retention
 
 [Service]
 Type=oneshot
 Environment=GATEWAY_LOG_DIR=${OPERATOR_DIR}/log
 Environment=S3_OPERATOR_CONFIG=/etc/s3-gateway/operator.conf
 ExecStart=/usr/local/sbin/s3-gateway-log-maintenance
+Nice=10
+IOSchedulingClass=idle
 EOF
+chmod 644 "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service"
 
 echo "==> Privileged-path hardening (mirrors install-runtime-hardening.sh)"
 chroot "$ROOTFS" bash -c "
@@ -232,6 +294,17 @@ chroot "$ROOTFS" chown "${OPERATOR_USER}:${SERVICE_USER}" \
     "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
 chroot "$ROOTFS" chmod 664 \
     "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
+
+# Same check install-log-retention.sh runs: a bad rotation config should fail the
+# build, not silently leave every unit with logs that never roll over. Debug mode
+# only parses and reports; it rotates nothing and the state file is discarded.
+if ! LR_CHECK="$(chroot "$ROOTFS" logrotate -d --state /tmp/s3-gateway-logrotate-check.status \
+        /etc/s3-gateway/logrotate.conf 2>&1)"; then
+    echo "ERROR: logrotate rejected /etc/s3-gateway/logrotate.conf:" >&2
+    echo "$LR_CHECK" >&2
+    exit 1
+fi
+rm -f "$ROOTFS/tmp/s3-gateway-logrotate-check.status"
 
 echo "==> Installing the first-boot provisioning service"
 install -d -m 755 "$ROOTFS/opt/s3-gateway/firstboot"
@@ -315,6 +388,7 @@ systemctl --root="$ROOTFS" enable "${SERVICE_NAME}.service"
 systemctl --root="$ROOTFS" enable "${WEBADMIN_SERVICE}.service"
 systemctl --root="$ROOTFS" enable s3-gateway-firstboot.service
 systemctl --root="$ROOTFS" enable postgresql.service
+systemctl --root="$ROOTFS" enable s3-gateway-log-rotate.timer
 systemctl --root="$ROOTFS" enable s3-gateway-log-maintenance.timer
 
 echo "==> customize90-s3-gateway complete"

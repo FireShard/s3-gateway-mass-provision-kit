@@ -44,7 +44,7 @@ locale:
   default: en_US.UTF-8
   keyboard_keymap: us
   keyboard_layout: English (US)
-  timezone: America/New_York
+  timezone: Asia/Kuala_Lumpur
 
 packages:
   - git

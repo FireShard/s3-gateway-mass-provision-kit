@@ -1,0 +1,13 @@
+gateway_id,site,notes
+s3-gw-03,siteA,replacement for damaged unit
+s3-gw-04,siteA,new pole run
+s3-gw-05,siteB,
+s3-gw-06,siteB,
+
+# "site" is only used if you pass --site-files-root to flash-and-provision.sh,
+# e.g. --site-files-root site-files/ with:
+#   site-files/siteA/samplelist.csv
+#   site-files/siteA/pygw_conf.py
+#   site-files/siteA/required-siteAgw.zip
+# Leave "site" empty to keep whatever samplelist.csv/pygw_conf.py is already
+# baked into the golden image's operator workspace.
