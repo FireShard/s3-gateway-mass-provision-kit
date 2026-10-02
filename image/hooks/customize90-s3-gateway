@@ -20,9 +20,11 @@
 # unit's first start (see s3-gateway-webadmin-initkey below).
 #
 # The log policy (scripts/install-log-retention.sh) is likewise installed offline:
-#   00:00 daily  s3-gateway-log-rotate.timer       new gateway.log / mqtt.log / error.log
+#   00:00 daily  s3-gateway-log-rotate.timer       new gateway.log / mqtt.log / error.log; the
+#                                                  finished day goes to log/rotated/
 #                                                  (config: /etc/s3-gateway/logrotate.conf)
-#   09:00 daily  s3-gateway-log-maintenance.timer  gzip rotated logs > 7 days, delete > 3 months
+#   09:00 daily  s3-gateway-log-maintenance.timer  gzip rotated logs > 7 days into log/compressed/,
+#                                                  delete > 3 months
 # Midnight / 09:00 are the unit's local time, i.e. locale.timezone in gateway-golden.yaml.
 set -euo pipefail
 
@@ -82,6 +84,14 @@ for f in scripts/log-maintenance.sh \
         exit 1
     fi
 done
+
+# The rotation config below writes finished days into log/rotated/. A log-maintenance.sh
+# from before the rotated/ + compressed/ layout would never compress or delete them.
+if ! grep -q 'ROTATED_DIR' "$SRC/scripts/log-maintenance.sh"; then
+    echo "ERROR: $SRC/scripts/log-maintenance.sh predates the log/rotated + log/compressed layout." >&2
+    echo "Rotated logs would pile up unprocessed. Re-sync image/s3-zigbee-gateway/ from the current source tree." >&2
+    exit 1
+fi
 
 WEBADMIN_PASSWORD="${S3_WEBADMIN_PASSWORD:-}"
 if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFORE-BUILDING" ]; then
@@ -208,8 +218,9 @@ ${OPERATOR_DIR}/log/mqtt.log {
     notifempty
     rotate 365
     dateext
-    dateyesterday
     dateformat .%Y-%m-%d
+    olddir rotated
+    createolddir 2775 ${OPERATOR_USER} ${SERVICE_USER}
     nocompress
     copytruncate
     su ${OPERATOR_USER} ${SERVICE_USER}
@@ -219,9 +230,11 @@ chmod 644 "$ROOTFS/etc/s3-gateway/logrotate.conf"
 
 # Seed logrotate's state file with an old "last rotated" date for each log. Without
 # this, the unit's FIRST run only records today's date and rotates nothing (logrotate
-# treats a file it has never seen as "just rotated"), so the first midnight passes
-# with no new log file. With it, the first 00:00 run rotates properly. The state file
-# is rewritten by logrotate itself on every run.
+# never rotates a log it has not seen before), so the first midnight passes with no
+# new log file. With it, the first 00:00 run rotates properly. install-log-retention.sh
+# does the same job with today's date; an old date is equivalent for an image, because
+# the build day is long past by the time a unit first boots. logrotate rewrites the
+# state file itself on every run.
 {
     echo "logrotate state -- version 2"
     for log in gateway error mqtt; do
@@ -240,7 +253,7 @@ install -m 644 "$SRC/deploy/systemd/s3-gateway-log-maintenance.timer" \
 # Generated rather than copied: the repo's unit hard-codes /home/pi/S3Gateway/log.
 cat > "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service" <<EOF
 [Unit]
-Description=S3 Gateway log retention
+Description=S3 Gateway log retention (compress after 7 days, delete after 3 months)
 
 [Service]
 Type=oneshot
@@ -272,6 +285,11 @@ setfacl -m u:${SERVICE_USER}:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
 setfacl -d -m u:${SERVICE_USER}:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
 setfacl -d -m m:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
 setfacl -m u:${SERVICE_USER}:x /home/${OPERATOR_USER} '$OPERATOR_DIR'
+# Rotated (plain, newest 7 days) and compressed (.gz) daily logs live in these two
+# subfolders; same owner/mode as install-log-retention.sh creates. The rotate and
+# retention jobs run as root, so only the operator needs to own them.
+install -d -m 2775 '$OPERATOR_DIR/log/rotated' '$OPERATOR_DIR/log/compressed'
+chown ${OPERATOR_USER}:${SERVICE_USER} '$OPERATOR_DIR/log/rotated' '$OPERATOR_DIR/log/compressed'
 rm -rf '$TARGET_DIR/PYSerialGateway/GPSlog'
 ln -s '$OPERATOR_DIR/GPSlog' '$TARGET_DIR/PYSerialGateway/GPSlog'
 chown -h root:${SERVICE_USER} '$TARGET_DIR/PYSerialGateway/GPSlog'
