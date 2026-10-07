@@ -461,7 +461,7 @@ A site folder can hold any of these files. They are copied to the card next to t
 
 | File | Purpose |
 |---|---|
-| `samplelist.csv` | The list of samples for this site. |
+| node-list `.csv` | The list of samples for this site. Usually `samplelist.csv`, but the name is whatever `localDBpath` says inside `pygw_conf.py`. |
 | `pygw_conf.py` | The gateway's site configuration. |
 | `required-*gw.zip` | The site's required-gateway package (for example `required-3gw.zip`). |
 
@@ -504,7 +504,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 | **"Does not look like a Raspberry Pi disk image"** | Wrong file. Choose the golden `.img`. |
 | **"Gateway ID ... not valid"** | See section 8. |
 | **"ID was already flashed"** | Each gateway needs a unique ID. Only answer yes if you are deliberately re-making that same card. |
-| **Site folder rejected** | It has none of `samplelist.csv`, `pygw_conf.py`, `required-*gw.zip`, or the name is misspelled. |
+| **Site folder rejected** | It has none of the node-list `.csv` named in `pygw_conf.py`, `pygw_conf.py`, `required-*gw.zip`, or the name is misspelled. |
 | **Windows: "You need to format the disk"** after flashing | Click **Cancel**. That is normal for a Raspberry Pi card. |
 | **Card marked INCOMPLETE** | It failed or was cancelled. Flash it again. Do not use it as it is. |
 | **The window closes too fast (Windows)** | Start it with the `.bat`, which keeps the window open until you press Enter. |

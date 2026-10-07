@@ -383,8 +383,24 @@ chmod 755 "$ROOTFS/usr/local/sbin/s3-gateway-webadmin-initkey"
 
 # The only privilege the web admin gets: passwordless sudo for s3-gateway-dbup
 # (its "Apply" button). Same rule and validation as install-webadmin.sh.
-sed "s|__OPERATOR_USER__|${OPERATOR_USER}|g" "$SRC/deploy/sudoers/s3-gateway-webadmin" \
+# sudoers requires fully-qualified command paths, so the template's __SYSTEMCTL__
+# placeholder (used by its `reboot` rule) is resolved to the absolute path of
+# systemctl as it exists INSIDE the target rootfs (usrmerge: /bin -> usr/bin).
+SYSTEMCTL_BIN=""
+for cand in /usr/bin/systemctl /bin/systemctl; do
+    if [ -x "$ROOTFS$cand" ]; then SYSTEMCTL_BIN="$cand"; break; fi
+done
+[ -n "$SYSTEMCTL_BIN" ] || { echo "ERROR: systemctl not found in the target rootfs; cannot render the web admin sudoers file." >&2; exit 1; }
+
+sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__SYSTEMCTL__|${SYSTEMCTL_BIN}|g" \
+    "$SRC/deploy/sudoers/s3-gateway-webadmin" \
     > "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
+# Fail with a clear message if the template grows a placeholder this hook doesn't know about.
+if grep -nE '__[A-Z0-9_]+__' "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin" >&2; then
+    echo "ERROR: unsubstituted placeholder(s) left in s3-gateway-webadmin sudoers (see lines above)." >&2
+    rm -f "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
+    exit 1
+fi
 chmod 440 "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
 chroot "$ROOTFS" chown root:root /etc/sudoers.d/s3-gateway-webadmin
 chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-webadmin

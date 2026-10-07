@@ -8,7 +8,9 @@
 #
 # It looks for a small drop-in folder on the boot partition:
 #   <bootpart>/s3-gateway-provision/provision.env   (required: GATEWAY_ID=...)
-#   <bootpart>/s3-gateway-provision/samplelist.csv   (optional site override)
+#   <bootpart>/s3-gateway-provision/<node list>.csv  (optional site override; the
+#                                                    name is localDBpath in pygw_conf.py,
+#                                                    samplelist.csv by default)
 #   <bootpart>/s3-gateway-provision/pygw_conf.py     (optional site override)
 #   <bootpart>/s3-gateway-provision/required-*gw.zip (optional site bundle)
 #
@@ -89,10 +91,32 @@ chown root:"$SERVICE_USER" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
 # --- optional site-specific files ------------------------------------------
-if [ -f "$PROVISION_DIR/samplelist.csv" ]; then
-    log "Installing site samplelist.csv into $OPERATOR_DIR"
+# The node-list CSV is named by localDBpath in the pygw_conf.py that will be in
+# use: the site's one if it was dropped on the card, else the image's own.
+# Default is samplelist.csv.
+read_csv_name() {
+    local conf="$1" name=""
+    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
+    if [ -f "$conf" ]; then
+        name="$(tr -d '\r' < "$conf" \
+            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
+            | tail -n 1 || true)"
+    fi
+    if [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
+        echo "$name"
+    else
+        echo "samplelist.csv"
+    fi
+}
+CONF_IN_USE="$OPERATOR_DIR/pygw_conf.py"
+[ -f "$PROVISION_DIR/pygw_conf.py" ] && CONF_IN_USE="$PROVISION_DIR/pygw_conf.py"
+CSV_NAME="$(read_csv_name "$CONF_IN_USE")"
+if [ -f "$PROVISION_DIR/$CSV_NAME" ]; then
+    log "Installing site node list $CSV_NAME into $OPERATOR_DIR"
     install -o "$OPERATOR_USER" -g "$OPERATOR_USER" -m 644 \
-        "$PROVISION_DIR/samplelist.csv" "$OPERATOR_DIR/samplelist.csv"
+        "$PROVISION_DIR/$CSV_NAME" "$OPERATOR_DIR/$CSV_NAME"
+elif [ -f "$PROVISION_DIR/pygw_conf.py" ]; then
+    log "WARNING: pygw_conf.py points at '$CSV_NAME' but it is not in $PROVISION_DIR - no node list installed"
 fi
 if [ -f "$PROVISION_DIR/pygw_conf.py" ]; then
     log "Installing site pygw_conf.py into $OPERATOR_DIR"

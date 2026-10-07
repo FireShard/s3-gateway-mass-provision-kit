@@ -107,6 +107,30 @@ boot_partition_of() {
     fi
 }
 
+# The node-list CSV is not always called samplelist.csv: the site's
+# pygw_conf.py names it (localDBpath = '...'). Print that name; fall back to
+# samplelist.csv when there is no pygw_conf.py or it has no usable setting.
+# Like Python, the last active assignment wins. Warnings go to stderr.
+site_csv_name() {
+    local site_dir="$1" conf name=""
+    local default="samplelist.csv"
+    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
+    conf="$site_dir/pygw_conf.py"
+    if [ -f "$conf" ]; then
+        name="$(tr -d '\r' < "$conf" \
+            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
+            | tail -n 1 || true)"
+    fi
+    if [ -z "$name" ]; then
+        echo "$default"
+    elif [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
+        echo "$name"
+    else
+        echo "WARNING: localDBpath '$name' in $conf is not a plain file name - using $default instead." >&2
+        echo "$default"
+    fi
+}
+
 provision_card() {
     local gw_id="$1" site_dir="$2"
     local bootpart mnt
@@ -122,7 +146,16 @@ provision_card() {
     printf 'GATEWAY_ID=%s\n' "$gw_id" > "$pdir/provision.env"
 
     if [ -n "$site_dir" ] && [ -d "$site_dir" ]; then
-        [ -f "$site_dir/samplelist.csv" ] && cp "$site_dir/samplelist.csv" "$pdir/"
+        local csv_name
+        csv_name="$(site_csv_name "$site_dir")"
+        # The provision folder is ours alone: drop node lists left by an
+        # earlier run so they cannot follow this card to a different site.
+        rm -f "$pdir"/*.csv
+        if [ -f "$site_dir/$csv_name" ]; then
+            cp "$site_dir/$csv_name" "$pdir/$csv_name"
+        elif [ -f "$site_dir/pygw_conf.py" ]; then
+            echo "WARNING: pygw_conf.py in $site_dir points at '$csv_name', but that file is not in the site folder - this gateway will have no node list." >&2
+        fi
         [ -f "$site_dir/pygw_conf.py" ] && cp "$site_dir/pygw_conf.py" "$pdir/"
         cp "$site_dir"/required-*gw.zip "$pdir/" 2>/dev/null || true
     fi

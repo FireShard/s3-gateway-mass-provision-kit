@@ -1,3 +1,5 @@
 flash-log.csv
 *.img
 *.zip
+*.csv
+*.py

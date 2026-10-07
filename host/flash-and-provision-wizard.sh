@@ -450,11 +450,29 @@ prompt_gateway_id() { # -> $GW_ID
         return 0
     done
 }
+site_csv_name() { # dir -> name of the node-list CSV the site's pygw_conf.py points at
+    # (localDBpath = '...'; the last active assignment wins, like Python).
+    # Falls back to samplelist.csv. flash-and-provision.sh does the same
+    # lookup when it copies the files, and warns about unusable settings.
+    local d="$1" name=""
+    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
+    if [ -f "$d/pygw_conf.py" ]; then
+        name="$(tr -d '\r' < "$d/pygw_conf.py" \
+            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
+            | tail -n 1 || true)"
+    fi
+    if [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
+        echo "$name"
+    else
+        echo "samplelist.csv"
+    fi
+}
 site_inspect() { # dir -> SITE_FOUND / SITE_MISSING ; returns 1 if nothing usable
-    local d="$1" f
+    local d="$1" f csv
     local -a zips=()
     SITE_FOUND=(); SITE_MISSING=()
-    if [ -f "$d/samplelist.csv" ]; then SITE_FOUND+=("samplelist.csv"); else SITE_MISSING+=("samplelist.csv"); fi
+    csv="$(site_csv_name "$d")"
+    if [ -f "$d/$csv" ]; then SITE_FOUND+=("$csv"); else SITE_MISSING+=("$csv"); fi
     if [ -f "$d/pygw_conf.py" ]; then SITE_FOUND+=("pygw_conf.py"); else SITE_MISSING+=("pygw_conf.py"); fi
     zips=("$d"/required-*gw.zip)
     if [ "${#zips[@]}" -gt 0 ]; then
@@ -502,7 +520,7 @@ pick_site() { # -> $SITE, $SITE_DIR ; returns 1 to go back
         [ "$pick" -eq 0 ] && return 0
         d="${dirs[pick-1]}"
         if ! site_inspect "$d"; then
-            err "The folder '$(basename "$d")' has none of the expected files (samplelist.csv, pygw_conf.py, required-*gw.zip)."
+            err "The folder '$(basename "$d")' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
             continue
         fi
         say "  Site '$(basename "$d")' will install: $(join_by_comma "${SITE_FOUND[@]}")"

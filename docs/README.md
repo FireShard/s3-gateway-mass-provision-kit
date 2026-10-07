@@ -247,11 +247,13 @@ The script recognizes these three files:
 
 | File | Installed location |
 |---|---|
-| `samplelist.csv` | `/home/pi/S3Gateway/samplelist.csv` |
+| node-list CSV (`samplelist.csv` by default) | `/home/pi/S3Gateway/<same name>` |
 | `pygw_conf.py` | `/home/pi/S3Gateway/pygw_conf.py` |
 | `required-*gw.zip` | `/opt/s3-gateway/app/pyserialgateway/` |
 
 All three are optional.
+
+The node-list CSV does not have to be called `samplelist.csv`. The flasher reads the file name from `localDBpath = '...'` in the site's `pygw_conf.py` and copies that file; the card installs it under the same name. If there is no `pygw_conf.py`, or it has no `localDBpath`, `samplelist.csv` is used. The name must be a plain file name (no folders). If `pygw_conf.py` names a CSV that is not in the site folder, the flasher warns that the gateway will have no node list.
 
 If provided, they replace the default files in the image before the database setup runs.
 

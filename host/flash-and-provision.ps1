@@ -628,14 +628,45 @@ function Dismount-BootVolume {
 # ---------------------------------------------------------------------------
 # provision.env + site files
 # ---------------------------------------------------------------------------
+function Get-SiteCsvName {
+    # The node-list CSV is not always called samplelist.csv: the site's
+    # pygw_conf.py names it (localDBpath = '...'). Like Python, the last active
+    # assignment wins. Falls back to samplelist.csv when there is no
+    # pygw_conf.py or no usable setting; Warning is set when it is unusable.
+    param([string]$Dir)
+    $default = 'samplelist.csv'
+    $result = [pscustomobject]@{ Name = $default; Warning = '' }
+    $conf = Join-Path $Dir 'pygw_conf.py'
+    if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) { return $result }
+    $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($conf))
+    $m = [regex]::Matches($text, '(?m)^[ \t]*localDBpath[ \t]*=[ \t]*([''"])([^''"\r\n]*)\1')
+    if ($m.Count -eq 0) { return $result }
+    $name = $m[$m.Count - 1].Groups[2].Value
+    if (($name -match '^[A-Za-z0-9_][A-Za-z0-9._ -]*$') -and ($name -ine 'provision.env') -and ($name -ine 'pygw_conf.py')) {
+        $result.Name = $name
+    } else {
+        $result.Warning = "localDBpath '$name' in $conf is not a plain file name - using $default instead."
+    }
+    return $result
+}
+
 function Get-SitePlan {
     param([string]$Dir)
-    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @() }
+    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Warnings = @() }
     if ([string]::IsNullOrEmpty($Dir)) { return $plan }
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return $plan }
     $plan.Exists = $true
+    $csv = Get-SiteCsvName -Dir $Dir
+    $plan.CsvName = $csv.Name
+    $warns = @()
+    if ($csv.Warning) { $warns += $csv.Warning }
+    $hasConf = Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf
+    if ($hasConf -and -not (Test-Path -LiteralPath (Join-Path $Dir $csv.Name) -PathType Leaf)) {
+        $warns += "pygw_conf.py in $Dir points at '$($csv.Name)', but that file is not in the site folder - this gateway will have no node list."
+    }
+    $plan.Warnings = $warns
     $items = @()
-    foreach ($name in 'samplelist.csv', 'pygw_conf.py') {
+    foreach ($name in $csv.Name, 'pygw_conf.py') {
         $f = Join-Path $Dir $name
         if (Test-Path -LiteralPath $f -PathType Leaf) {
             $items += [pscustomobject]@{ Source = $f; Dest = $name; Text = $true }
@@ -658,10 +689,11 @@ function Show-SitePlan {
     }
     if (-not $Plan.Exists) { Write-Warn "site folder not found: $($Plan.Dir) - no site files will be copied to this card."; return }
     if ($Plan.Items.Count -eq 0) {
-        Write-Warn "no samplelist.csv, pygw_conf.py or required-*gw.zip in $($Plan.Dir) - no site files will be copied to this card."
+        Write-Warn "no node-list .csv, pygw_conf.py or required-*gw.zip in $($Plan.Dir) - no site files will be copied to this card."
         return
     }
     Write-Host ('Site files from {0}: {1}' -f $Plan.Dir, (($Plan.Items | ForEach-Object { $_.Dest }) -join ', '))
+    foreach ($w in @($Plan.Warnings)) { Write-Warn $w }
 }
 
 function ConvertTo-LfText {
@@ -707,7 +739,7 @@ function Write-ProvisionFiles {
 
     # Leftovers from an earlier run must not follow this card to a different site.
     foreach ($f in @(Get-ChildItem -LiteralPath $pdir -File -ErrorAction SilentlyContinue)) {
-        if ((@('provision.env', 'samplelist.csv', 'pygw_conf.py') -contains $f.Name) -or ($f.Name -like 'required-*gw.zip')) {
+        if ((@('provision.env', 'pygw_conf.py') -contains $f.Name) -or ($f.Extension -ieq '.csv') -or ($f.Name -like 'required-*gw.zip')) {
             Remove-Item -LiteralPath $f.FullName -Force
         }
     }
@@ -823,7 +855,8 @@ function Test-BatchPlan {
             } else {
                 $p = Get-SitePlan -Dir (Join-Path $script:SiteFilesRoot $r.Site)
                 if (-not $p.Exists) { $warns += "$tag - site folder not found: $($p.Dir)" }
-                elseif ($p.Items.Count -eq 0) { $warns += "$tag - no samplelist.csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
+                elseif ($p.Items.Count -eq 0) { $warns += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
+                else { foreach ($pw in @($p.Warnings)) { $warns += "$tag - $pw" } }
             }
         }
     }
@@ -1352,7 +1385,7 @@ function Get-SiteReport {
     $plan = Get-SitePlan -Dir $Dir
     $found = @($plan.Items | ForEach-Object { $_.Dest })
     $missing = @()
-    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'samplelist.csv') -PathType Leaf)) { $missing += 'samplelist.csv' }
+    if (-not (Test-Path -LiteralPath (Join-Path $Dir $plan.CsvName) -PathType Leaf)) { $missing += $plan.CsvName }
     if (-not (Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf)) { $missing += 'pygw_conf.py' }
     if (@($found | Where-Object { $_ -like 'required-*gw.zip' }).Count -eq 0) { $missing += 'required-*gw.zip' }
     return [pscustomobject]@{ Found = $found; Missing = $missing; Usable = ($found.Count -gt 0) }
@@ -1397,7 +1430,7 @@ function Select-Site {
         $d = $dirs[[int]$pick - 1]
         $rep = Get-SiteReport -Dir $d.FullName
         if (-not $rep.Usable) {
-            Write-Err "The folder '$($d.Name)' has none of the expected files (samplelist.csv, pygw_conf.py, required-*gw.zip)."
+            Write-Err "The folder '$($d.Name)' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
             continue
         }
         Write-Say "  Site '$($d.Name)' will install: $($rep.Found -join ', ')"
