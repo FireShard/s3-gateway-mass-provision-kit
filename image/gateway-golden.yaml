@@ -60,7 +60,12 @@ packages:
   - postgresql-client
   - iproute2
   - minicom
-  # Wi-Fi supplicant only; NetworkManager/nmtui are intentionally NOT installed.
+  - logrotate
+  # NetworkManager (nmcli / nmtui) configures the Ethernet IP, including the
+  # static address set after installation. The build hook masks
+  # systemd-networkd so the two never both manage the NIC.
+  - network-manager
+  # Wi-Fi supplicant (optional Wi-Fi); NetworkManager only Recommends it.
   - wpasupplicant
 
 # These become shell environment variables inside the customize hooks

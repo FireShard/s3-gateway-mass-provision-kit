@@ -108,26 +108,60 @@ boot_partition_of() {
 }
 
 # The node-list CSV is not always called samplelist.csv: the site's
-# pygw_conf.py names it (localDBpath = '...'). Print that name; fall back to
-# samplelist.csv when there is no pygw_conf.py or it has no usable setting.
-# Like Python, the last active assignment wins. Warnings go to stderr.
+# pygw_conf.py names it (localDBpath = '...'), and s3-gateway-dbup - which runs
+# on first boot and refuses to continue on a bad value - applies a strict rule.
+# This mirrors that rule (scripts/s3-gateway-dbup: read_local_db_name):
+#   - the LAST top-level `localDBpath = '<name>'` line wins, like Python
+#   - <name> is a plain file name: [A-Za-z0-9_.-], 1-60 characters, then .csv
+# No pygw_conf.py in the site folder -> the image's own config is used and the
+# name is the default, samplelist.csv.
+# Prints the name; on an unusable setting prints "ERROR: ..." on stderr, returns 1.
 site_csv_name() {
-    local site_dir="$1" conf name=""
+    local site_dir="$1" conf line name
     local default="samplelist.csv"
-    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
+    local ok_re='^[A-Za-z0-9_.-]{1,60}\.csv$'
+    local lit_re="^localDBpath[[:space:]]*=[[:space:]]*(['\"])([^'\"\\\\]*)\\1[[:space:]]*(#.*)?$"
     conf="$site_dir/pygw_conf.py"
-    if [ -f "$conf" ]; then
-        name="$(tr -d '\r' < "$conf" \
-            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
-            | tail -n 1 || true)"
+    if [ ! -f "$conf" ]; then
+        echo "$default"
+        return 0
     fi
-    if [ -z "$name" ]; then
-        echo "$default"
-    elif [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
-        echo "$name"
-    else
-        echo "WARNING: localDBpath '$name' in $conf is not a plain file name - using $default instead." >&2
-        echo "$default"
+    line="$(tr -d '\r' < "$conf" | grep -E '^localDBpath[[:space:]]*=' | tail -n 1 || true)"
+    if [ -z "$line" ]; then
+        echo "ERROR: localDBpath is not set in $conf (s3-gateway-dbup refuses a pygw_conf.py without it)." >&2
+        return 1
+    fi
+    if ! [[ "$line" =~ $lit_re ]]; then
+        echo "ERROR: localDBpath in $conf must be a plain quoted string such as 'samplelist.csv'." >&2
+        return 1
+    fi
+    name="${BASH_REMATCH[2]}"
+    if ! [[ "$name" =~ $ok_re ]]; then
+        echo "ERROR: localDBpath '$name' in $conf must be a plain file name ending in .csv (letters, digits, . _ - only, at most 60 characters before .csv, no folders)." >&2
+        return 1
+    fi
+    echo "$name"
+}
+
+# Would this site folder make first boot fail? Prints the problem and returns 1
+# if so. Checked BEFORE a card is written: a card that fails here would sit in
+# a retry loop at s3-gateway-dbup on every boot until someone fixed it by hand.
+site_problem() {
+    local d="$1" name
+    name="$(site_csv_name "$d" 2>&1)" || { echo "${name#ERROR: }"; return 1; }
+    if [ -f "$d/pygw_conf.py" ] && [ "$name" != "samplelist.csv" ] && [ ! -f "$d/$name" ]; then
+        echo "pygw_conf.py names the node list '$name' but that file is not in $d (the image only ships samplelist.csv, so first boot would stop at s3-gateway-dbup)."
+        return 1
+    fi
+    return 0
+}
+
+preflight_site() { # dir label -> exit the whole script if the site folder is unusable
+    local d="$1" label="$2" problem
+    [ -n "$d" ] && [ -d "$d" ] || return 0
+    if ! problem="$(site_problem "$d")"; then
+        echo "ERROR: $label: $problem" >&2
+        return 1
     fi
 }
 
@@ -147,14 +181,12 @@ provision_card() {
 
     if [ -n "$site_dir" ] && [ -d "$site_dir" ]; then
         local csv_name
-        csv_name="$(site_csv_name "$site_dir")"
+        csv_name="$(site_csv_name "$site_dir")"    # already validated by preflight_site
         # The provision folder is ours alone: drop node lists left by an
         # earlier run so they cannot follow this card to a different site.
         rm -f "$pdir"/*.csv
         if [ -f "$site_dir/$csv_name" ]; then
             cp "$site_dir/$csv_name" "$pdir/$csv_name"
-        elif [ -f "$site_dir/pygw_conf.py" ]; then
-            echo "WARNING: pygw_conf.py in $site_dir points at '$csv_name', but that file is not in the site folder - this gateway will have no node list." >&2
         fi
         [ -f "$site_dir/pygw_conf.py" ] && cp "$site_dir/pygw_conf.py" "$pdir/"
         cp "$site_dir"/required-*gw.zip "$pdir/" 2>/dev/null || true
@@ -177,6 +209,13 @@ do_one_card() {
 
 if [ -n "$BATCH_CSV" ]; then
     [ -f "$BATCH_CSV" ] || { echo "ERROR: batch CSV not found: $BATCH_CSV" >&2; exit 1; }
+    # Check every site folder named in the list before the first card is written.
+    pre_bad=0
+    while IFS=, read -r gw_id site _rest; do
+        [ -n "$gw_id" ] && [ -n "$site" ] && [ -n "$SITE_FILES_ROOT" ] || continue
+        preflight_site "$SITE_FILES_ROOT/$site" "$gw_id (site $site)" || pre_bad=1
+    done < <(tail -n +2 "$BATCH_CSV")
+    [ "$pre_bad" -eq 0 ] || { echo "Nothing was written. Fix the site files above and run again." >&2; exit 1; }
     tail -n +2 "$BATCH_CSV" | while IFS=, read -r gw_id site _rest; do
         [ -n "$gw_id" ] || continue
         site_dir=""
@@ -190,5 +229,6 @@ if [ -n "$BATCH_CSV" ]; then
         do_one_card "$gw_id" "$site_dir"
     done
 else
+    preflight_site "$SITE_DIR" "site files" || { echo "Nothing was written. Fix the site files above and run again." >&2; exit 1; }
     do_one_card "$GATEWAY_ID" "$SITE_DIR"
 fi

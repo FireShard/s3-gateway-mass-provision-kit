@@ -215,6 +215,15 @@ If `.local` does not resolve, find the Pi's IP address from your network/DHCP li
 ssh pi@<gateway-ip>
 ```
 
+A new gateway gets its address by DHCP from its fibre/SIM router. If this gateway needs a fixed address, set it once you are logged in:
+
+```bash
+sudo nmcli con mod Wired ipv4.method manual ipv4.addresses <ip>/<prefix> ipv4.gateway <router-ip> ipv4.dns "<router-ip> 8.8.8.8"
+sudo nmcli con up Wired
+```
+
+Your SSH session drops when the address changes; reconnect to the new address. Full details are in the *Networking (NetworkManager)* section of `README.md`.
+
 ### Step 4 — launch the gateway service and check that the gateway service is running
 
 After logging in:
@@ -505,6 +514,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 | **"Gateway ID ... not valid"** | See section 8. |
 | **"ID was already flashed"** | Each gateway needs a unique ID. Only answer yes if you are deliberately re-making that same card. |
 | **Site folder rejected** | It has none of the node-list `.csv` named in `pygw_conf.py`, `pygw_conf.py`, `required-*gw.zip`, or the name is misspelled. |
+| **"cannot be used" / flasher refuses the card** | The site's `pygw_conf.py` has a bad `localDBpath` (not a plain quoted `'name.csv'`, or the name has folders, spaces or capital `.CSV`), or it names a node list that is not in the site folder. Nothing was written to the card. Get corrected site files from the project team. |
 | **Windows: "You need to format the disk"** after flashing | Click **Cancel**. That is normal for a Raspberry Pi card. |
 | **Card marked INCOMPLETE** | It failed or was cancelled. Flash it again. Do not use it as it is. |
 | **The window closes too fast (Windows)** | Start it with the `.bat`, which keeps the window open until you press Enter. |

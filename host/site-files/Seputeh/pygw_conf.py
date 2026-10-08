@@ -21,7 +21,7 @@ client_ID = 'SAMPLE1HERE'                                  # client ID for first
 client_ID_2 = 'SAMPLE2HERE'								# client ID for second instance (normally not used unless dual-polling required, run PYGatewayListener_v1.0_2)
 
 # Static gateway and database specs
-localDBpath = 'samplelist.csv'			    		    # Local deploy node list file in RaspPi
+localDBpath = 'samplelisttest.csv'			    		    # Local deploy node list file in RaspPi
 first_GW_data = ('FE01', '1001', '20')                          # First gateway node specifications
 second_GW_data = ('FE02', '1001', '20')                         # Second gateway node specifications
 

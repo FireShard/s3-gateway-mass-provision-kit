@@ -630,41 +630,56 @@ function Dismount-BootVolume {
 # ---------------------------------------------------------------------------
 function Get-SiteCsvName {
     # The node-list CSV is not always called samplelist.csv: the site's
-    # pygw_conf.py names it (localDBpath = '...'). Like Python, the last active
-    # assignment wins. Falls back to samplelist.csv when there is no
-    # pygw_conf.py or no usable setting; Warning is set when it is unusable.
+    # pygw_conf.py names it (localDBpath = '...'), and s3-gateway-dbup - which
+    # runs on first boot and refuses to continue on a bad value - applies a
+    # strict rule. This mirrors it (scripts/s3-gateway-dbup, read_local_db_name):
+    #   - the LAST top-level `localDBpath = '<name>'` line wins, like Python
+    #   - <name> is [A-Za-z0-9_.-], 1-60 characters, then .csv (case-sensitive)
+    # No pygw_conf.py in the folder -> the image's own config is used -> samplelist.csv.
+    # Returns Name, and Error when the setting is unusable.
     param([string]$Dir)
-    $default = 'samplelist.csv'
-    $result = [pscustomobject]@{ Name = $default; Warning = '' }
+    $result = [pscustomobject]@{ Name = 'samplelist.csv'; Error = '' }
     $conf = Join-Path $Dir 'pygw_conf.py'
     if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) { return $result }
     $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($conf))
-    $m = [regex]::Matches($text, '(?m)^[ \t]*localDBpath[ \t]*=[ \t]*([''"])([^''"\r\n]*)\1')
-    if ($m.Count -eq 0) { return $result }
-    $name = $m[$m.Count - 1].Groups[2].Value
-    if (($name -match '^[A-Za-z0-9_][A-Za-z0-9._ -]*$') -and ($name -ine 'provision.env') -and ($name -ine 'pygw_conf.py')) {
-        $result.Name = $name
-    } else {
-        $result.Warning = "localDBpath '$name' in $conf is not a plain file name - using $default instead."
+    $line = $null
+    foreach ($l in ($text -split "`r?`n")) { if ($l -match '^localDBpath[ \t]*=') { $line = $l } }
+    if ($null -eq $line) {
+        $result.Error = 'localDBpath is not set in pygw_conf.py (s3-gateway-dbup refuses a pygw_conf.py without it).'
+        return $result
     }
+    $m = [regex]::Match($line, '^localDBpath[ \t]*=[ \t]*([''"])([^''"\\]*)\1[ \t]*(#.*)?$')
+    if (-not $m.Success) {
+        $result.Error = "localDBpath in pygw_conf.py must be a plain quoted string such as 'samplelist.csv'."
+        return $result
+    }
+    $name = $m.Groups[2].Value
+    if ($name -cnotmatch '^[A-Za-z0-9_.-]{1,60}\.csv$') {
+        $result.Error = "localDBpath '$name' in pygw_conf.py must be a plain file name ending in .csv (letters, digits, . _ - only, at most 60 characters before .csv, no folders)."
+        return $result
+    }
+    $result.Name = $name
     return $result
 }
 
 function Get-SitePlan {
     param([string]$Dir)
-    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Warnings = @() }
+    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Errors = @() }
     if ([string]::IsNullOrEmpty($Dir)) { return $plan }
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return $plan }
     $plan.Exists = $true
     $csv = Get-SiteCsvName -Dir $Dir
     $plan.CsvName = $csv.Name
-    $warns = @()
-    if ($csv.Warning) { $warns += $csv.Warning }
+    # Errors are things that would make first boot stop at s3-gateway-dbup (it
+    # would then retry on every boot until someone fixed the card by hand), so
+    # a card with errors is never written.
+    $errs = @()
+    if ($csv.Error) { $errs += $csv.Error }
     $hasConf = Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf
-    if ($hasConf -and -not (Test-Path -LiteralPath (Join-Path $Dir $csv.Name) -PathType Leaf)) {
-        $warns += "pygw_conf.py in $Dir points at '$($csv.Name)', but that file is not in the site folder - this gateway will have no node list."
+    if ((-not $csv.Error) -and $hasConf -and ($csv.Name -cne 'samplelist.csv') -and -not (Test-Path -LiteralPath (Join-Path $Dir $csv.Name) -PathType Leaf)) {
+        $errs += "pygw_conf.py names the node list '$($csv.Name)' but that file is not in $Dir (the image only ships samplelist.csv, so first boot would stop at s3-gateway-dbup)."
     }
-    $plan.Warnings = $warns
+    $plan.Errors = $errs
     $items = @()
     foreach ($name in $csv.Name, 'pygw_conf.py') {
         $f = Join-Path $Dir $name
@@ -693,7 +708,6 @@ function Show-SitePlan {
         return
     }
     Write-Host ('Site files from {0}: {1}' -f $Plan.Dir, (($Plan.Items | ForEach-Object { $_.Dest }) -join ', '))
-    foreach ($w in @($Plan.Warnings)) { Write-Warn $w }
 }
 
 function ConvertTo-LfText {
@@ -783,6 +797,9 @@ function Invoke-Card {
     $disk = Get-TargetDisk
     $plan = Get-SitePlan -Dir $SiteDirPath
     Show-SitePlan -Plan $plan
+    if (@($plan.Errors).Count -gt 0) {
+        throw ("The site files in $($plan.Dir) cannot be used:`n  - " + (@($plan.Errors) -join "`n  - ") + "`nNothing was written to the card. Fix the site files and try again.")
+    }
     $fingerprint = Confirm-Disk -Disk $disk
 
     if (-not $script:NoFlash) { [void](Invoke-Flash -Disk $disk -Fingerprint $fingerprint) }
@@ -856,7 +873,7 @@ function Test-BatchPlan {
                 $p = Get-SitePlan -Dir (Join-Path $script:SiteFilesRoot $r.Site)
                 if (-not $p.Exists) { $warns += "$tag - site folder not found: $($p.Dir)" }
                 elseif ($p.Items.Count -eq 0) { $warns += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
-                else { foreach ($pw in @($p.Warnings)) { $warns += "$tag - $pw" } }
+                else { foreach ($pe in @($p.Errors)) { $errors += "$tag - site '$($r.Site)': $pe" } }
             }
         }
     }
@@ -1388,7 +1405,7 @@ function Get-SiteReport {
     if (-not (Test-Path -LiteralPath (Join-Path $Dir $plan.CsvName) -PathType Leaf)) { $missing += $plan.CsvName }
     if (-not (Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf)) { $missing += 'pygw_conf.py' }
     if (@($found | Where-Object { $_ -like 'required-*gw.zip' }).Count -eq 0) { $missing += 'required-*gw.zip' }
-    return [pscustomobject]@{ Found = $found; Missing = $missing; Usable = ($found.Count -gt 0) }
+    return [pscustomobject]@{ Found = $found; Missing = $missing; Errors = @($plan.Errors); Usable = (($found.Count -gt 0) -and (@($plan.Errors).Count -eq 0)) }
 }
 
 function Select-Site {
@@ -1430,7 +1447,13 @@ function Select-Site {
         $d = $dirs[[int]$pick - 1]
         $rep = Get-SiteReport -Dir $d.FullName
         if (-not $rep.Usable) {
-            Write-Err "The folder '$($d.Name)' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
+            if (@($rep.Errors).Count -gt 0) {
+                Write-Err "The folder '$($d.Name)' cannot be used:"
+                foreach ($e in $rep.Errors) { Write-Err "  - $e" }
+                Write-Say 'Ask the project team for corrected site files.'
+            } else {
+                Write-Err "The folder '$($d.Name)' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
+            }
             continue
         }
         Write-Say "  Site '$($d.Name)' will install: $($rep.Found -join ', ')"
@@ -1609,9 +1632,16 @@ function Read-WizardBatchCsv {
                 if (-not (Test-Path -LiteralPath $sd -PathType Container)) {
                     Write-Err "Row ${n} ($id): site folder not found: $sd"
                     $bad = $true
-                } elseif (-not (Get-SiteReport -Dir $sd).Usable) {
-                    Write-Err "Row ${n} ($id): site folder '$siteName' has none of the expected files."
-                    $bad = $true
+                } else {
+                    $srep = Get-SiteReport -Dir $sd
+                    if (-not $srep.Usable) {
+                        if (@($srep.Errors).Count -gt 0) {
+                            foreach ($e in $srep.Errors) { Write-Err "Row ${n} ($id): site '$siteName': $e" }
+                        } else {
+                            Write-Err "Row ${n} ($id): site folder '$siteName' has none of the expected files."
+                        }
+                        $bad = $true
+                    }
                 }
             }
         }

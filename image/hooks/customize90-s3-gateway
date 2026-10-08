@@ -63,6 +63,7 @@ fi
 # --- web admin pre-flight: fail here, in seconds, not after the apt/pip steps ---
 WEBADMIN_SERVICE="s3-gateway-webadmin"
 for f in webadmin/app.py \
+         scripts/s3-gateway-envset \
          deploy/systemd/s3-gateway-webadmin.service \
          deploy/sudoers/s3-gateway-webadmin \
          deploy/webadmin.env.example; do
@@ -93,6 +94,27 @@ if ! grep -q 'ROTATED_DIR' "$SRC/scripts/log-maintenance.sh"; then
     exit 1
 fi
 
+# --- localDBpath pre-flight: the node list is NOT always samplelist.csv ---------
+# The site's pygw_conf.py names it (localDBpath). The image seeds, first boot
+# installs and s3-gateway-dbup validates that file. A source tree from before
+# this change still hardcodes samplelist.csv in s3-gateway-dbup, so a site that
+# renames its list would fail at first boot.
+if ! grep -q 'read_local_db_name' "$SRC/scripts/s3-gateway-dbup" || [ ! -f "$SRC/scripts/lib/localdb.sh" ]; then
+    echo "ERROR: $SRC predates localDBpath support (s3-gateway-dbup has no read_local_db_name, or scripts/lib/localdb.sh is missing)." >&2
+    echo "Re-sync image/s3-zigbee-gateway/ from the current source tree (the one with localdbpath-fix applied)." >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+. "$SRC/scripts/lib/localdb.sh"
+NODE_LIST="$(s3_node_list_name "$SRC/PYSerialGateway/pygw_conf.py")" || {
+    echo "ERROR: the pygw_conf.py in the source tree has an unusable localDBpath (see above); the image would fail at first boot." >&2
+    exit 1
+}
+[ -f "$SRC/PYSerialGateway/samplelist.csv" ] || {
+    echo "ERROR: $SRC/PYSerialGateway/samplelist.csv (the placeholder node list) is missing." >&2
+    exit 1
+}
+
 WEBADMIN_PASSWORD="${S3_WEBADMIN_PASSWORD:-}"
 if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFORE-BUILDING" ]; then
     echo "ERROR: S3_WEBADMIN_PASSWORD is unset, shorter than 8 characters, or still the placeholder." >&2
@@ -100,6 +122,10 @@ if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFO
     exit 1
 fi
 
+# NOTE: the wlan0 override below only matters while systemd-networkd is active.
+# NetworkManager takes over networking further down (see "Installing
+# NetworkManager"), so this file is inert; it is kept in case networkd is ever
+# re-enabled.
 echo "==> Excluding wlan0 from systemd-networkd-wait-online (no WiFi profile is baked in, so wlan0 never gets a carrier - without this, wait-online fails every boot and delays s3-zigbee-gateway.service, which orders After=network-online.target)"
 cat >> "$ROOTFS/etc/systemd/network/02-wlan0.network" <<'EOF'
 
@@ -170,7 +196,11 @@ chroot "$ROOTFS" chmod 640 "$TARGET_DIR/.env"
 
 echo "==> Seeding operator workspace at $OPERATOR_DIR"
 install -d -m 755 "$ROOTFS$OPERATOR_DIR"
-install -m 644 "$SRC/PYSerialGateway/samplelist.csv" "$ROOTFS$OPERATOR_DIR/samplelist.csv"
+# The placeholder list is installed under the name localDBpath gives it in the
+# seeded pygw_conf.py (samplelist.csv by default); a site's own list replaces it
+# at first boot. Same rule as scripts/bootstrap-production-pi.sh.
+echo "    node list file (localDBpath): $NODE_LIST"
+install -m 644 "$SRC/PYSerialGateway/samplelist.csv" "$ROOTFS$OPERATOR_DIR/$NODE_LIST"
 install -m 644 "$SRC/PYSerialGateway/pygw_conf.py" "$ROOTFS$OPERATOR_DIR/pygw_conf.py"
 [ -f "$SRC/PYSerialGateway/README-OPERATOR.md" ] && install -m 644 "$SRC/PYSerialGateway/README-OPERATOR.md" "$ROOTFS$OPERATOR_DIR/README-OPERATOR.md"
 chroot "$ROOTFS" chown -R "${OPERATOR_USER}:${OPERATOR_USER}" "$OPERATOR_DIR"
@@ -381,18 +411,28 @@ sed -i "s|^S3_WEBADMIN_SECRET_KEY=.*|S3_WEBADMIN_SECRET_KEY=${KEY}|" "$ENV_FILE"
 EOF
 chmod 755 "$ROOTFS/usr/local/sbin/s3-gateway-webadmin-initkey"
 
-# The only privilege the web admin gets: passwordless sudo for s3-gateway-dbup
-# (its "Apply" button). Same rule and validation as install-webadmin.sh.
-# sudoers requires fully-qualified command paths, so the template's __SYSTEMCTL__
-# placeholder (used by its `reboot` rule) is resolved to the absolute path of
-# systemctl as it exists INSIDE the target rootfs (usrmerge: /bin -> usr/bin).
-SYSTEMCTL_BIN=""
-for cand in /usr/bin/systemctl /bin/systemctl; do
-    if [ -x "$ROOTFS$cand" ]; then SYSTEMCTL_BIN="$cand"; break; fi
-done
-[ -n "$SYSTEMCTL_BIN" ] || { echo "ERROR: systemctl not found in the target rootfs; cannot render the web admin sudoers file." >&2; exit 1; }
+# Root helper behind the web admin's .env page. The sudoers rule below names this
+# exact path; without the file the page fails with
+# "sudo: /usr/local/sbin/s3-gateway-envset: command not found".
+bash -n "$SRC/scripts/s3-gateway-envset"
+install -o root -g root -m 755 "$SRC/scripts/s3-gateway-envset" "$ROOTFS/usr/local/sbin/s3-gateway-envset"
 
-sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__SYSTEMCTL__|${SYSTEMCTL_BIN}|g" \
+# systemctl path inside the image (what the Overview "Reboot" button is allowed to run).
+SYSTEMCTL_PATH="$(chroot "$ROOTFS" sh -c 'readlink -f "$(command -v systemctl)"')"
+case "$SYSTEMCTL_PATH" in
+    /*/systemctl) ;;
+    *) echo "ERROR: could not find systemctl inside the image (got '$SYSTEMCTL_PATH')" >&2; exit 1 ;;
+esac
+if grep -q '^S3_REBOOT_COMMAND=' "$ROOTFS$WEBADMIN_ENV"; then
+    sed -i "s|^S3_REBOOT_COMMAND=.*|S3_REBOOT_COMMAND=sudo -n ${SYSTEMCTL_PATH} reboot|" "$ROOTFS$WEBADMIN_ENV"
+else
+    printf 'S3_REBOOT_COMMAND=sudo -n %s reboot\n' "$SYSTEMCTL_PATH" >> "$ROOTFS$WEBADMIN_ENV"
+fi
+
+# The only privileges the web admin gets: passwordless sudo for s3-gateway-dbup (its
+# "Apply" button), s3-gateway-envset (the .env page) and the exact reboot command.
+# Same rule and validation as install-webadmin.sh.
+sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__SYSTEMCTL__|${SYSTEMCTL_PATH}|g" \
     "$SRC/deploy/sudoers/s3-gateway-webadmin" \
     > "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
 # Fail with a clear message if the template grows a placeholder this hook doesn't know about.
@@ -417,10 +457,53 @@ cat > "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service.d/10-initkey.conf"
 ExecStartPre=+/usr/local/sbin/s3-gateway-webadmin-initkey
 EOF
 
+echo "==> Installing NetworkManager (takes over IP configuration from systemd-networkd)"
+# --no-install-recommends: network-manager RECOMMENDS modemmanager (which probes
+# USB serial ports and can corrupt traffic to the Zigbee module) and ppp. Ethernet
+# needs none of it. wpasupplicant is listed explicitly because it is only a
+# Recommends here and is wanted for optional Wi-Fi.
+chroot "$ROOTFS" apt-get install -y --no-install-recommends network-manager wpasupplicant
+
+# Exactly one network manager may own the NIC. If networkd stayed active, both
+# would fight over eth0 (duplicate/flapping addresses). Mask rather than just
+# disable so nothing - socket activation, a base-layer unit, a later package -
+# can bring networkd back. The /etc/systemd/network/*.network files from the
+# base layer are left in place but are no longer read.
+systemctl --root="$ROOTFS" disable systemd-networkd.service systemd-networkd.socket \
+    systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+systemctl --root="$ROOTFS" mask systemd-networkd.service systemd-networkd.socket \
+    systemd-networkd-wait-online.service
+
+# Default Ethernet profile: DHCP on any wired NIC (no interface name is baked in,
+# so it works whether the NIC is called eth0 or end0). It exists so that
+#   1. a freshly flashed gateway still gets an address from the fibre/SIM router, and
+#   2. the static-IP step in the docs has a fixed profile name to modify ("Wired").
+# NetworkManager refuses keyfiles that are not root-owned and mode 600.
+NM_WIRED="$ROOTFS/etc/NetworkManager/system-connections/wired.nmconnection"
+install -d -m 755 "$ROOTFS/etc/NetworkManager/system-connections"
+cat > "$NM_WIRED" <<NMEOF
+[connection]
+id=Wired
+uuid=$(cat /proc/sys/kernel/random/uuid)
+type=ethernet
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=auto
+NMEOF
+chown root:root "$NM_WIRED"
+chmod 600 "$NM_WIRED"
+
 echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
 systemctl --root="$ROOTFS" enable "${SERVICE_NAME}.service"
 systemctl --root="$ROOTFS" enable "${WEBADMIN_SERVICE}.service"
 systemctl --root="$ROOTFS" enable s3-gateway-firstboot.service
+# NetworkManager-wait-online is what makes network-online.target mean something
+# now that systemd-networkd-wait-online is masked.
+systemctl --root="$ROOTFS" enable NetworkManager.service
+systemctl --root="$ROOTFS" enable NetworkManager-wait-online.service
 systemctl --root="$ROOTFS" enable postgresql.service
 systemctl --root="$ROOTFS" enable s3-gateway-log-rotate.timer
 systemctl --root="$ROOTFS" enable s3-gateway-log-maintenance.timer

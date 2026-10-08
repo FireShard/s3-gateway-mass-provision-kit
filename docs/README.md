@@ -253,7 +253,14 @@ The script recognizes these three files:
 
 All three are optional.
 
-The node-list CSV does not have to be called `samplelist.csv`. The flasher reads the file name from `localDBpath = '...'` in the site's `pygw_conf.py` and copies that file; the card installs it under the same name. If there is no `pygw_conf.py`, or it has no `localDBpath`, `samplelist.csv` is used. The name must be a plain file name (no folders). If `pygw_conf.py` names a CSV that is not in the site folder, the flasher warns that the gateway will have no node list.
+The node-list CSV does not have to be called `samplelist.csv`. Its name is `localDBpath` in the site's `pygw_conf.py`. The flasher copies that file, first boot installs it under the same name, and `s3-gateway-dbup`, the gateway and the web admin all use it.
+
+The flasher applies the same rule as `s3-gateway-dbup`, because DBUP stops first boot if the setting is wrong:
+
+- `localDBpath` must be written as a plain quoted string on its own line, for example `localDBpath = 'cheras_nodes.csv'`.
+- The name uses only letters, digits, `.`, `_` and `-` (at most 60 characters before the `.csv`), ends in lowercase `.csv`, and has no folders.
+- If there is no `pygw_conf.py` in the site folder, the image's own config is used and the list is `samplelist.csv`.
+- If the site folder breaks the rule, or `pygw_conf.py` names a list that is not in the folder (and it is not `samplelist.csv`), the flasher **refuses the card and writes nothing**. In a batch it checks every site before the first card. A card written with such files would stop at DBUP on every boot until someone fixed it by hand.
 
 If provided, they replace the default files in the image before the database setup runs.
 
@@ -413,6 +420,52 @@ The physical Zigbee dongle is hardware, so each gateway must have its own correc
 
 ---
 
+# Networking (NetworkManager)
+
+The image uses **NetworkManager** for the network, not systemd-networkd. `systemd-networkd` is masked at build time so the two never both manage the Ethernet port.
+
+- Every gateway is expected to be on **Ethernet**, plugged into its fibre or SIM-card router.
+- A fresh card gets an address by **DHCP** from that router. This comes from a baked-in wired profile named **`Wired`**. It is not tied to an interface name, so it works whether the port is `eth0` or `end0`.
+- The static IP is set **after installation**, by changing the `Wired` profile (see below). It is not set at flash time.
+- ModemManager is not installed and stays masked. The SIM card is in the router, not in the Pi, and ModemManager can disturb the Zigbee USB serial port.
+
+### Set a static IP on a gateway
+
+Run on the gateway (over SSH, or with a keyboard and screen). Replace the example values with ones from the router's LAN:
+
+```bash
+sudo nmcli con mod Wired \
+    ipv4.method manual \
+    ipv4.addresses 192.168.1.50/24 \
+    ipv4.gateway 192.168.1.1 \
+    ipv4.dns "192.168.1.1 8.8.8.8"
+sudo nmcli con up Wired
+```
+
+- The address must be inside the router's LAN subnet, and outside the router's DHCP pool (or reserved in the router) so nothing else is handed the same address.
+- The gateway address is the router's LAN address. Most SIM and fibre routers also work as the DNS server; the second DNS entry is a fallback.
+- Your SSH session drops when the address changes. Reconnect with `ssh pi@<new-ip>`.
+- `nmtui` does the same thing with menus if you prefer: *Edit a connection*, then `Wired`, then set IPv4 to *Manual*.
+
+Check the result:
+
+```bash
+nmcli dev status          # the Ethernet device should show "connected" on Wired
+ip -4 addr show           # the static address should be listed
+ping -c 3 8.8.8.8         # the router has internet
+```
+
+Go back to DHCP:
+
+```bash
+sudo nmcli con mod Wired ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
+sudo nmcli con up Wired
+```
+
+Cards flashed from an image built **before** this change still use systemd-networkd. They need a re-flash with the new image to get NetworkManager.
+
+---
+
 # What is still manual?
 
 These tasks are intentionally left to the operator:
@@ -420,6 +473,7 @@ These tasks are intentionally left to the operator:
 - Connect the correct Zigbee USB gateway.
 - Decide which physical Pi receives which `GATEWAY_ID`.
 - Decide which site belongs to each gateway.
+- Set the static IP on each gateway after installation (see *Networking (NetworkManager)*).
 - Perform development-only work such as application changes, database schema changes, or protocol changes.
 
 This tool is for **production provisioning**, not development.
@@ -468,7 +522,8 @@ The provisioning kit already handles several issues found during real hardware t
 
 - The image build runs as root.
 - Required packages are installed early enough for the Python environment.
-- Wi-Fi does not block `network-online.target`.
+- The image build refuses a source tree that predates `localDBpath` support, and seeds the placeholder node list under the name `localDBpath` gives it.
+- Networking is handled by NetworkManager (systemd-networkd is masked), so a missing Wi-Fi profile cannot block `network-online.target`.
 - Required gateway log directories are created.
 - Gateway logs are linked to the central operator log directory.
 - Locale settings are explicitly configured.

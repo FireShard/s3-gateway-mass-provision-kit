@@ -451,42 +451,62 @@ prompt_gateway_id() { # -> $GW_ID
     done
 }
 site_csv_name() { # dir -> name of the node-list CSV the site's pygw_conf.py points at
-    # (localDBpath = '...'; the last active assignment wins, like Python).
-    # Falls back to samplelist.csv. flash-and-provision.sh does the same
-    # lookup when it copies the files, and warns about unusable settings.
-    local d="$1" name=""
-    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
-    if [ -f "$d/pygw_conf.py" ]; then
-        name="$(tr -d '\r' < "$d/pygw_conf.py" \
-            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
-            | tail -n 1 || true)"
+    # Same rule as s3-gateway-dbup (which runs at first boot and refuses a bad
+    # value): the LAST top-level `localDBpath = '<name>'` line wins and <name>
+    # is [A-Za-z0-9_.-], 1-60 characters, then .csv. No pygw_conf.py in the
+    # folder -> the image's own config is used -> samplelist.csv.
+    # flash-and-provision.sh repeats this check before it writes a card.
+    # Prints the name; on an unusable setting prints "ERROR: ..." and returns 1.
+    local d="$1" conf line name
+    local ok_re='^[A-Za-z0-9_.-]{1,60}\.csv$'
+    local lit_re="^localDBpath[[:space:]]*=[[:space:]]*(['\"])([^'\"\\\\]*)\\1[[:space:]]*(#.*)?$"
+    conf="$d/pygw_conf.py"
+    if [ ! -f "$conf" ]; then echo "samplelist.csv"; return 0; fi
+    line="$(tr -d '\r' < "$conf" | grep -E '^localDBpath[[:space:]]*=' | tail -n 1 || true)"
+    if [ -z "$line" ]; then
+        echo "ERROR: localDBpath is not set in pygw_conf.py (s3-gateway-dbup refuses a pygw_conf.py without it)."; return 1
     fi
-    if [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
-        echo "$name"
-    else
-        echo "samplelist.csv"
+    if ! [[ "$line" =~ $lit_re ]]; then
+        echo "ERROR: localDBpath in pygw_conf.py must be a plain quoted string such as 'samplelist.csv'."; return 1
     fi
+    name="${BASH_REMATCH[2]}"
+    if ! [[ "$name" =~ $ok_re ]]; then
+        echo "ERROR: localDBpath '$name' in pygw_conf.py must be a plain file name ending in .csv (letters, digits, . _ - only, at most 60 characters before .csv, no folders)."; return 1
+    fi
+    echo "$name"
 }
-site_inspect() { # dir -> SITE_FOUND / SITE_MISSING ; returns 1 if nothing usable
+site_inspect() { # dir -> SITE_FOUND / SITE_MISSING / SITE_ERRORS ; returns 1 if the folder cannot be used
     local d="$1" f csv
     local -a zips=()
-    SITE_FOUND=(); SITE_MISSING=()
-    csv="$(site_csv_name "$d")"
-    if [ -f "$d/$csv" ]; then SITE_FOUND+=("$csv"); else SITE_MISSING+=("$csv"); fi
+    SITE_FOUND=(); SITE_MISSING=(); SITE_ERRORS=()
+    if csv="$(site_csv_name "$d")"; then
+        if [ -f "$d/$csv" ]; then
+            SITE_FOUND+=("$csv")
+        else
+            SITE_MISSING+=("$csv")
+            # The image only ships samplelist.csv. If pygw_conf.py names another file
+            # and it is not here, first boot would stop at s3-gateway-dbup.
+            if [ -f "$d/pygw_conf.py" ] && [ "$csv" != "samplelist.csv" ]; then
+                SITE_ERRORS+=("pygw_conf.py names the node list '$csv' but that file is not in this folder (the image only ships samplelist.csv, so first boot would stop at s3-gateway-dbup).")
+            fi
+        fi
+    else
+        SITE_ERRORS+=("${csv#ERROR: }")
+    fi
     if [ -f "$d/pygw_conf.py" ]; then SITE_FOUND+=("pygw_conf.py"); else SITE_MISSING+=("pygw_conf.py"); fi
     zips=("$d"/required-*gw.zip)
-    if [ "${#zips[@]}" -gt 0 ]; then
+    if [ -e "${zips[0]}" ]; then
         for f in "${zips[@]}"; do SITE_FOUND+=("$(basename "$f")"); done
     else
         SITE_MISSING+=("required-*gw.zip")
     fi
-    [ "${#SITE_FOUND[@]}" -gt 0 ]
+    [ "${#SITE_ERRORS[@]}" -eq 0 ] && [ "${#SITE_FOUND[@]}" -gt 0 ]
 }
 join_by_comma() { local IFS=,; printf '%s' "$*" | sed 's/,/, /g'; }
 pick_site() { # -> $SITE, $SITE_DIR ; returns 1 to go back
     SITE=""; SITE_DIR=""
     local -a dirs=()
-    local d i pick
+    local d i pick f
     if [ -d "$SITE_ROOT" ]; then
         for d in "$SITE_ROOT"/*/; do [ -d "$d" ] && dirs+=("${d%/}"); done
     fi
@@ -520,7 +540,13 @@ pick_site() { # -> $SITE, $SITE_DIR ; returns 1 to go back
         [ "$pick" -eq 0 ] && return 0
         d="${dirs[pick-1]}"
         if ! site_inspect "$d"; then
-            err "The folder '$(basename "$d")' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
+            if [ "${#SITE_ERRORS[@]}" -gt 0 ]; then
+                err "The folder '$(basename "$d")' cannot be used:"
+                for f in "${SITE_ERRORS[@]}"; do err "  - $f"; done
+                say "Ask the project team for corrected site files."
+            else
+                err "The folder '$(basename "$d")' has none of the expected files (the node-list .csv named in pygw_conf.py, pygw_conf.py, required-*gw.zip)."
+            fi
             continue
         fi
         say "  Site '$(basename "$d")' will install: $(join_by_comma "${SITE_FOUND[@]}")"
@@ -637,7 +663,7 @@ mode_relabel() {
 
 B_ID=(); B_SITE=()
 parse_batch_csv() { # file -> B_ID / B_SITE ; returns 1 if anything is wrong
-    local file="$1" line first=1 idcol=-1 sitecol=-1 i n=0 bad=0 id site seen=" " lc
+    local file="$1" line first=1 idcol=-1 sitecol=-1 i n=0 bad=0 id site seen=" " lc f
     local -a cols=()
     B_ID=(); B_SITE=()
     while IFS= read -r line || [ -n "$line" ]; do
@@ -674,7 +700,12 @@ parse_batch_csv() { # file -> B_ID / B_SITE ; returns 1 if anything is wrong
             if [ ! -d "$SITE_ROOT/$site" ]; then
                 err "Row $n ($id): site folder not found: $SITE_ROOT/$site"; bad=1
             elif ! site_inspect "$SITE_ROOT/$site"; then
-                err "Row $n ($id): site folder '$site' has none of the expected files."; bad=1
+                if [ "${#SITE_ERRORS[@]}" -gt 0 ]; then
+                    for f in "${SITE_ERRORS[@]}"; do err "Row $n ($id): site '$site': $f"; done
+                else
+                    err "Row $n ($id): site folder '$site' has none of the expected files."
+                fi
+                bad=1
             fi
         fi
         B_ID+=("$id"); B_SITE+=("$site")

@@ -92,31 +92,34 @@ chmod 640 "$ENV_FILE"
 
 # --- optional site-specific files ------------------------------------------
 # The node-list CSV is named by localDBpath in the pygw_conf.py that will be in
-# use: the site's one if it was dropped on the card, else the image's own.
-# Default is samplelist.csv.
-read_csv_name() {
-    local conf="$1" name=""
-    local ok_re='^[A-Za-z0-9_][A-Za-z0-9._ -]*$'
-    if [ -f "$conf" ]; then
-        name="$(tr -d '\r' < "$conf" \
-            | sed -n -E "s/^[[:space:]]*localDBpath[[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" \
-            | tail -n 1 || true)"
-    fi
-    if [[ "$name" =~ $ok_re ]] && [ "$name" != "provision.env" ] && [ "$name" != "pygw_conf.py" ]; then
-        echo "$name"
-    else
-        echo "samplelist.csv"
-    fi
-}
+# use: the site's one if it was dropped on the card, else the image's own. The
+# name is resolved with the app's own helper (scripts/lib/localdb.sh, shipped in
+# the image with the source tree) so this script, s3-gateway-dbup, the gateway
+# and the web admin can never disagree about what the file is called.
+LOCALDB_LIB="$TARGET_DIR/scripts/lib/localdb.sh"
 CONF_IN_USE="$OPERATOR_DIR/pygw_conf.py"
 [ -f "$PROVISION_DIR/pygw_conf.py" ] && CONF_IN_USE="$PROVISION_DIR/pygw_conf.py"
-CSV_NAME="$(read_csv_name "$CONF_IN_USE")"
-if [ -f "$PROVISION_DIR/$CSV_NAME" ]; then
+CSV_NAME=""
+if [ -f "$LOCALDB_LIB" ]; then
+    # shellcheck disable=SC1090
+    . "$LOCALDB_LIB"
+    if ! CSV_NAME="$(s3_node_list_name "$CONF_IN_USE" 2>&1)"; then
+        # Not fatal here: s3-gateway-dbup (below) refuses the same value with the
+        # same message, after hostname and database are set up, so the unit still
+        # leaves a usable log and a reachable hostname.
+        log "WARNING: $CSV_NAME"
+        CSV_NAME=""
+    fi
+else
+    log "WARNING: $LOCALDB_LIB missing - assuming the node list is samplelist.csv"
+    CSV_NAME="samplelist.csv"
+fi
+if [ -n "$CSV_NAME" ] && [ -f "$PROVISION_DIR/$CSV_NAME" ]; then
     log "Installing site node list $CSV_NAME into $OPERATOR_DIR"
     install -o "$OPERATOR_USER" -g "$OPERATOR_USER" -m 644 \
         "$PROVISION_DIR/$CSV_NAME" "$OPERATOR_DIR/$CSV_NAME"
-elif [ -f "$PROVISION_DIR/pygw_conf.py" ]; then
-    log "WARNING: pygw_conf.py points at '$CSV_NAME' but it is not in $PROVISION_DIR - no node list installed"
+elif [ -n "$CSV_NAME" ] && [ -f "$PROVISION_DIR/pygw_conf.py" ]; then
+    log "WARNING: pygw_conf.py points at '$CSV_NAME' but it is not in $PROVISION_DIR - using whatever is already in $OPERATOR_DIR"
 fi
 if [ -f "$PROVISION_DIR/pygw_conf.py" ]; then
     log "Installing site pygw_conf.py into $OPERATOR_DIR"
