@@ -1,0 +1,9 @@
+# Keep line endings right whatever the checkout platform: the Linux scripts break
+# with CRLF, and cmd.exe can mis-handle labels in a batch file saved with bare LF.
+*.sh                  text eol=lf
+image/hooks/*         text eol=lf
+image/firstboot/*     text eol=lf
+*.bat                 text eol=crlf
+*.ps1                 text eol=crlf
+*.zip                 binary
+*.img                 binary

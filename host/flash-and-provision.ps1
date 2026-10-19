@@ -368,15 +368,31 @@ function Show-DiskContents {
     }
 }
 
-function Test-PathOnDisk {
-    # True if the file/folder lives on a drive letter that belongs to $Disk.
-    param([string]$Path, $Disk)
-    if ([string]::IsNullOrEmpty($Path)) { return $false }
-    if ($Path -notmatch '^([A-Za-z]):') { return $false }    # UNC / relative: not a local drive letter
-    $letter = $Matches[1].ToUpper()
-    $hit = @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue |
-             Where-Object { (ConvertTo-DriveLetter -Value $_.DriveLetter) -eq $letter })
-    return ($hit.Count -gt 0)
+function Get-PathDriveLetter {
+    # 'D:\kit\x.img' -> 'D'. Empty for UNC and relative paths (not on a local drive letter).
+    param([string]$Path)
+    if ($Path -match '^([A-Za-z]):') { return $Matches[1].ToUpper() }
+    return ''
+}
+
+function Get-DiskLetters {
+    # Drive letters of every partition on $Disk. Get-Partition is slow, so ask once per disk.
+    param($Disk)
+    return @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue |
+             ForEach-Object { ConvertTo-DriveLetter -Value $_.DriveLetter } |
+             Where-Object { $_ })
+}
+
+function Find-PathOnDisk {
+    # The first of $Paths that lives on a drive letter belonging to $Disk, or $null.
+    param([string[]]$Paths, $Disk)
+    $letters = @(Get-DiskLetters -Disk $Disk)
+    if ($letters.Count -eq 0) { return $null }
+    foreach ($p in $Paths) {
+        $letter = Get-PathDriveLetter -Path $p
+        if ($letter -and ($letters -contains $letter)) { return $p }
+    }
+    return $null
 }
 
 function Assert-SafeDisk {
@@ -387,10 +403,9 @@ function Assert-SafeDisk {
     if ((-not $script:AllowNonRemovable) -and ($script:CardBuses -notcontains [string]$Disk.BusType)) {
         throw "Disk $n ($($Disk.FriendlyName)) is on the '$($Disk.BusType)' bus, not a USB / SD card reader. If it really is your SD card reader, run again with -AllowNonRemovable."
     }
-    foreach ($p in $script:GuardPaths) {
-        if (Test-PathOnDisk -Path $p -Disk $Disk) {
-            throw "'$p' is stored on Disk $n - the very disk you selected. Wiping it would destroy that file. Copy it to your PC's own drive and try again."
-        }
+    $hit = Find-PathOnDisk -Paths $script:GuardPaths -Disk $Disk
+    if ($hit) {
+        throw "'$hit' is stored on Disk $n - the very disk you selected. Wiping it would destroy that file. Copy it to your PC's own drive and try again."
     }
 }
 
@@ -664,7 +679,7 @@ function Get-SiteCsvName {
 
 function Get-SitePlan {
     param([string]$Dir)
-    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Errors = @() }
+    $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Errors = @(); Found = @(); Missing = @(); Usable = $false }
     if ([string]::IsNullOrEmpty($Dir)) { return $plan }
     if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return $plan }
     $plan.Exists = $true
@@ -693,6 +708,16 @@ function Get-SitePlan {
         $items += [pscustomobject]@{ Source = $z.FullName; Dest = $z.Name; Text = $false }
     }
     $plan.Items = $items
+
+    # Found = what would be installed; Missing = expected files that are absent (the
+    # image default is kept); Usable = something to install and nothing that breaks first boot.
+    $plan.Found = @($items | ForEach-Object { $_.Dest })
+    $missing = @()
+    if ($plan.Found -notcontains $csv.Name) { $missing += $csv.Name }
+    if ($plan.Found -notcontains 'pygw_conf.py') { $missing += 'pygw_conf.py' }
+    if ($zips.Count -eq 0) { $missing += 'required-*gw.zip' }
+    $plan.Missing = $missing
+    $plan.Usable = (($plan.Found.Count -gt 0) -and ($errs.Count -eq 0))
     return $plan
 }
 
@@ -827,54 +852,81 @@ function Invoke-Card {
 # ---------------------------------------------------------------------------
 # Batch CSV
 # ---------------------------------------------------------------------------
-function Read-BatchCsv {
+function Read-GatewayList {
+    # Reads a batch CSV (header: gateway_id,site[,notes]). Blank lines, "#" comment lines,
+    # a BOM, Excel/Windows line endings, quotes and stray blanks are all fine.
+    # Returns Rows (Row, GatewayId, Site) and Errors (the file itself, or a Gateway ID that is
+    # invalid or listed twice). Rows with a bad ID are kept so row numbers match the file.
     param([string]$Path)
-    # '#' comment lines and blank lines are skipped (the example CSV ends with a block of them).
-    $lines = @([IO.File]::ReadAllLines($Path) | Where-Object { ($_.Trim() -ne '') -and (-not $_.TrimStart().StartsWith('#')) })
-    if ($lines.Count -lt 2) { throw "The batch CSV needs a header line (gateway_id,site) and at least one row: $Path" }
-    $rows = @($lines | ConvertFrom-Csv)
-    if ($rows.Count -eq 0) { throw "The batch CSV has no data rows: $Path" }
-    $names = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
-    $idCol = $names | Where-Object { $_.Trim() -ieq 'gateway_id' } | Select-Object -First 1
-    if (-not $idCol) { throw "The batch CSV needs a 'gateway_id' column. Columns found: $($names -join ', ')" }
-    $siteCol = $names | Where-Object { $_.Trim() -ieq 'site' } | Select-Object -First 1
-    $out = @()
-    $n = 0
-    foreach ($r in $rows) {
-        $n++
-        $gw = ([string]$r.$idCol).Trim()
-        $st = ''
-        if ($siteCol) { $st = ([string]$r.$siteCol).Trim() }
-        if (-not $gw) { Write-Warn "CSV data row $n has no gateway_id - skipped."; continue }
-        $out += [pscustomobject]@{ GatewayId = $gw; Site = $st }
+    $fail = { param($Message) return [pscustomobject]@{ Rows = @(); Errors = @($Message) } }
+
+    $lines = @()
+    $index = 0
+    foreach ($raw in [IO.File]::ReadAllLines($Path)) {
+        $line = $raw.TrimEnd("`r")
+        if ($index++ -eq 0) { $line = $line.TrimStart([char]0xFEFF) }
+        if ($line -match '^[\s,]*(#.*)?$') { continue }      # blank, comment, or an empty Excel row (",,,")
+        $lines += $line
     }
-    return $out
+    if ($lines.Count -eq 0) { return (& $fail 'The CSV file is empty.') }
+
+    # Header names: cleaned, and made unique so ConvertFrom-Csv accepts them.
+    $headers = @()
+    foreach ($h in $lines[0].Split(',')) {
+        $name = ConvertTo-CleanField -Value $h
+        if ((-not $name) -or ($headers -contains $name)) { $name = "column$($headers.Count)" }
+        $headers += $name
+    }
+    $idName   = $headers | Where-Object { $_.ToLowerInvariant() -eq 'gateway_id' } | Select-Object -First 1
+    $siteName = $headers | Where-Object { $_.ToLowerInvariant() -eq 'site' } | Select-Object -First 1
+    if (-not $idName) {
+        return (& $fail "The first line of the CSV must be a header containing 'gateway_id' (for example: gateway_id,site,notes).")
+    }
+
+    try { $records = @($lines | Select-Object -Skip 1 | ConvertFrom-Csv -Header $headers) }
+    catch { return (& $fail "The CSV could not be read: $($_.Exception.Message)") }
+    if ($records.Count -eq 0) { return (& $fail 'The CSV has a header but no cards.') }
+
+    $rows = @()
+    $errors = @()
+    $seen = @{}
+    $n = 0
+    foreach ($rec in $records) {
+        $n++
+        $id = ConvertTo-CleanField -Value ([string]$rec.$idName)
+        $site = ''
+        if ($siteName) { $site = ConvertTo-CleanField -Value ([string]$rec.$siteName) }
+        $key = $id.ToLowerInvariant()
+        if (-not (Test-GatewayId -Value $id)) {
+            $errors += "Row ${n}: '$id' is not a valid Gateway ID."
+        } elseif ($seen.ContainsKey($key)) {
+            $errors += "Row ${n}: Gateway ID '$id' appears twice in the CSV."
+        }
+        $seen[$key] = $true
+        $rows += [pscustomobject]@{ Row = $n; GatewayId = $id; Site = $site }
+    }
+    return [pscustomobject]@{ Rows = $rows; Errors = $errors }
 }
 
-function Test-BatchPlan {
-    # Checks the whole list up front so nothing is flashed until the CSV is sane.
+function Test-BatchSites {
+    # Command-line batch: checks the site folders named in the CSV before anything is flashed.
+    # A missing or empty folder is only a warning (the operator is asked whether to go on);
+    # site files that would break first boot are an error.
     param($Rows)
     $errors = @()
     $warns = @()
-    $seen = @{}
-    $i = 0
     foreach ($r in $Rows) {
-        $i++
-        $tag = "Row ${i} ($($r.GatewayId))"
-        if (-not (Test-GatewayId -Value $r.GatewayId)) { $errors += "$tag - not a valid hostname (letters, digits and '-' only, max 63)." }
-        $key = $r.GatewayId.ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { $errors += "$tag - duplicate of row $($seen[$key])." } else { $seen[$key] = $i }
-        if ($r.Site) {
-            if (-not (Test-SiteName -Value $r.Site)) {
-                $errors += "$tag - site name '$($r.Site)' must not contain \ / or :"
-            } elseif (-not $script:SiteFilesRoot) {
-                $warns += "$tag - names site '$($r.Site)' but -SiteFilesRoot was not given, so no site files will be copied."
-            } else {
-                $p = Get-SitePlan -Dir (Join-Path $script:SiteFilesRoot $r.Site)
-                if (-not $p.Exists) { $warns += "$tag - site folder not found: $($p.Dir)" }
-                elseif ($p.Items.Count -eq 0) { $warns += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
-                else { foreach ($pe in @($p.Errors)) { $errors += "$tag - site '$($r.Site)': $pe" } }
-            }
+        if (-not $r.Site) { continue }
+        $tag = "Row $($r.Row) ($($r.GatewayId))"
+        if (-not (Test-SiteName -Value $r.Site)) {
+            $errors += "$tag - site name '$($r.Site)' must not contain \ / or :"
+        } elseif (-not $script:SiteFilesRoot) {
+            $warns += "$tag - names site '$($r.Site)' but -SiteFilesRoot was not given, so no site files will be copied."
+        } else {
+            $p = Get-SitePlan -Dir (Join-Path $script:SiteFilesRoot $r.Site)
+            if (-not $p.Exists) { $warns += "$tag - site folder not found: $($p.Dir)" }
+            elseif ($p.Items.Count -eq 0) { $warns += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
+            else { foreach ($pe in @($p.Errors)) { $errors += "$tag - site '$($r.Site)': $pe" } }
         }
     }
     return [pscustomobject]@{ Errors = $errors; Warnings = $warns }
@@ -923,6 +975,7 @@ $script:MinImageBytes = [long](16MB)
 $script:LogHeader     = 'timestamp,operator,gateway_id,site,result,image,card_model,card_gb,device'
 $script:LogFile       = ''
 $script:LogOk         = $true
+$script:LogRowCache  = $null                    # parsed flash-log rows; reset whenever the log changes
 $script:ImageOk       = $false
 $script:WzSiteRoot    = ''
 $script:WzSite        = ''
@@ -1013,6 +1066,7 @@ function Read-KeyWithin {
 function Initialize-Log {
     $script:LogFile = Join-Path $PSScriptRoot 'flash-log.csv'
     $script:LogOk = $true
+    $script:LogRowCache = $null
     try {
         if (-not (Test-Path -LiteralPath $script:LogFile -PathType Leaf)) {
             [IO.File]::WriteAllText($script:LogFile, $script:LogHeader + "`n", (New-Object Text.UTF8Encoding($false)))
@@ -1032,10 +1086,11 @@ function ConvertTo-CsvField {
 }
 
 function Add-LogRow {
-    param([string]$Result, [string]$Gw, [string]$SiteName, [string]$Model, [long]$Bytes, [string]$Device)
+    # -Mode 'relabel' writes no image, so the record must not name one.
+    param([string]$Result, [string]$Gw, [string]$SiteName, [string]$Model, [long]$Bytes, [string]$Device, [string]$Mode = 'flash')
     if (-not $script:LogOk) { return }
     $img = 'none'
-    if ($script:Image) { $img = Split-Path -Leaf $script:Image }
+    if (($Mode -eq 'flash') -and $script:Image) { $img = Split-Path -Leaf $script:Image }
     $siteText = 'none'
     if ($SiteName) { $siteText = $SiteName }
     $gb = [long][Math]::Floor($Bytes / 1e9)
@@ -1043,6 +1098,7 @@ function Add-LogRow {
     $line = (($vals | ForEach-Object { ConvertTo-CsvField -Value ([string]$_) }) -join ',')
     try {
         [IO.File]::AppendAllText($script:LogFile, $line + "`n", (New-Object Text.UTF8Encoding($false)))
+        $script:LogRowCache = $null
     } catch {
         Write-Warn "Could not write to the log: $($_.Exception.Message)"
     }
@@ -1050,7 +1106,10 @@ function Add-LogRow {
 
 function Read-LogRows {
     if ((-not $script:LogFile) -or (-not (Test-Path -LiteralPath $script:LogFile -PathType Leaf))) { return @() }
-    try { return @(Import-Csv -LiteralPath $script:LogFile -ErrorAction Stop) } catch { return @() }
+    if ($null -eq $script:LogRowCache) {
+        try { $script:LogRowCache = @(Import-Csv -LiteralPath $script:LogFile -ErrorAction Stop) } catch { return @() }
+    }
+    return $script:LogRowCache
 }
 
 function Get-PriorUse {
@@ -1229,10 +1288,7 @@ function Update-GuardPaths {
 function Test-DiskProtected {
     param($Disk)
     if ($Disk.IsSystem -or $Disk.IsBoot) { return $true }
-    foreach ($p in $script:GuardPaths) {
-        if (Test-PathOnDisk -Path $p -Disk $Disk) { return $true }
-    }
-    return $false
+    return [bool](Find-PathOnDisk -Paths $script:GuardPaths -Disk $Disk)
 }
 
 function Get-DiskLabels {
@@ -1396,18 +1452,6 @@ function Read-GatewayId {
     }
 }
 
-function Get-SiteReport {
-    # What a site folder would install, and what it lacks.
-    param([string]$Dir)
-    $plan = Get-SitePlan -Dir $Dir
-    $found = @($plan.Items | ForEach-Object { $_.Dest })
-    $missing = @()
-    if (-not (Test-Path -LiteralPath (Join-Path $Dir $plan.CsvName) -PathType Leaf)) { $missing += $plan.CsvName }
-    if (-not (Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf)) { $missing += 'pygw_conf.py' }
-    if (@($found | Where-Object { $_ -like 'required-*gw.zip' }).Count -eq 0) { $missing += 'required-*gw.zip' }
-    return [pscustomobject]@{ Found = $found; Missing = $missing; Errors = @($plan.Errors); Usable = (($found.Count -gt 0) -and (@($plan.Errors).Count -eq 0)) }
-}
-
 function Select-Site {
     # Sets $script:WzSite / $script:WzSiteDir. Returns $false to go back.
     $script:WzSite = ''
@@ -1445,7 +1489,7 @@ function Select-Site {
         }
         if ([long]$pick -eq 0) { return $true }
         $d = $dirs[[int]$pick - 1]
-        $rep = Get-SiteReport -Dir $d.FullName
+        $rep = Get-SitePlan -Dir $d.FullName
         if (-not $rep.Usable) {
             if (@($rep.Errors).Count -gt 0) {
                 Write-Err "The folder '$($d.Name)' cannot be used:"
@@ -1480,7 +1524,7 @@ function Show-Plan {
     Write-Say ('   {0,-12} {1}' -f 'Gateway ID', $Id)
     $what = 'none - the defaults built into the image'
     if ($script:WzSiteDir) {
-        $rep = Get-SiteReport -Dir $script:WzSiteDir
+        $rep = Get-SitePlan -Dir $script:WzSiteDir
         $what = '{0} ({1})' -f $script:WzSite, ($rep.Found -join ', ')
     }
     Write-Say ('   {0,-12} {1}' -f 'Site files', $what)
@@ -1518,7 +1562,7 @@ function Complete-Card {
     if ($Ok) {
         $result = 'FLASHED'
         if ($Mode -ne 'flash') { $result = 'RELABELED' }
-        Add-LogRow -Result $result -Gw $Id -SiteName $script:WzSite -Model $c.Model -Bytes $c.Bytes -Device ('Disk ' + $c.Number)
+        Add-LogRow -Result $result -Gw $Id -SiteName $script:WzSite -Model $c.Model -Bytes $c.Bytes -Device ('Disk ' + $c.Number) -Mode $Mode
         $script:LastId = $Id
         $script:LastSite = 'none'
         if ($script:WzSite) { $script:LastSite = $script:WzSite }
@@ -1529,7 +1573,7 @@ function Complete-Card {
         Write-Host "`a" -NoNewline
         return $true
     }
-    Add-LogRow -Result 'INCOMPLETE' -Gw $Id -SiteName $script:WzSite -Model $c.Model -Bytes $c.Bytes -Device ('Disk ' + $c.Number)
+    Add-LogRow -Result 'INCOMPLETE' -Gw $Id -SiteName $script:WzSite -Model $c.Model -Bytes $c.Bytes -Device ('Disk ' + $c.Number) -Mode $Mode
     Write-Err 'This card was NOT completed (it failed or was cancelled). Read the messages above.'
     Write-Say '  Do not use this card until it has been flashed again successfully.'
     Write-Host "`a" -NoNewline
@@ -1582,75 +1626,36 @@ function Invoke-RelabelMode {
 }
 
 function Read-WizardBatchCsv {
-    # Returns the rows (Id, Site), or $null after printing what is wrong. Comment lines,
-    # blank lines, a BOM and Excel/Windows line endings are all fine.
+    # Returns the rows (Row, GatewayId, Site), or $null after printing what is wrong.
+    # Stricter than the command-line batch: a named site folder must exist and be usable.
     param([string]$Path)
-    $first = $true
-    $idCol = -1
-    $siteCol = -1
-    $n = 0
-    $bad = $false
-    $seen = @{}
-    $rows = @()
-    foreach ($raw in [IO.File]::ReadAllLines($Path)) {
-        $line = $raw.TrimEnd("`r")
-        if ($first) { $line = $line.TrimStart([char]0xFEFF) }
-        if ($line -match '^\s*(#.*)?$') { continue }
-        $cols = @($line.Split(',') | ForEach-Object { ConvertTo-CleanField -Value $_ })
-        if ($first) {
-            for ($i = 0; $i -lt $cols.Count; $i++) {
-                $h = $cols[$i].ToLowerInvariant()
-                if ($h -eq 'gateway_id') { $idCol = $i } elseif ($h -eq 'site') { $siteCol = $i }
-            }
-            if ($idCol -lt 0) {
-                Write-Err "The first line of the CSV must be a header containing 'gateway_id' (for example: gateway_id,site,notes)."
-                return $null
-            }
-            $first = $false
+    $list = Read-GatewayList -Path $Path
+    $bad = (@($list.Errors).Count -gt 0)
+    foreach ($e in $list.Errors) { Write-Err $e }
+    foreach ($r in $list.Rows) {
+        if (-not $r.Site) { continue }
+        $tag = "Row $($r.Row) ($($r.GatewayId))"
+        if (-not (Test-SiteName -Value $r.Site)) {
+            Write-Err "${tag}: site name '$($r.Site)' must not contain \ / or :"
+            $bad = $true
             continue
         }
-        $n++
-        $id = ''
-        if ($idCol -lt $cols.Count) { $id = $cols[$idCol] }
-        $siteName = ''
-        if (($siteCol -ge 0) -and ($siteCol -lt $cols.Count)) { $siteName = $cols[$siteCol] }
-        $lc = $id.ToLowerInvariant()
-        if (-not (Test-GatewayId -Value $id)) {
-            Write-Err "Row ${n}: '$id' is not a valid Gateway ID."
+        $dir = Join-Path $script:WzSiteRoot $r.Site
+        $plan = Get-SitePlan -Dir $dir
+        if (-not $plan.Exists) {
+            Write-Err "${tag}: site folder not found: $dir"
             $bad = $true
-        } elseif ($seen.ContainsKey($lc)) {
-            Write-Err "Row ${n}: Gateway ID '$id' appears twice in the CSV."
-            $bad = $true
-        }
-        $seen[$lc] = $true
-        if ($siteName) {
-            if (-not (Test-SiteName -Value $siteName)) {
-                Write-Err "Row ${n} ($id): site name '$siteName' must not contain \ / or :"
-                $bad = $true
+        } elseif (-not $plan.Usable) {
+            if (@($plan.Errors).Count -gt 0) {
+                foreach ($e in $plan.Errors) { Write-Err "${tag}: site '$($r.Site)': $e" }
             } else {
-                $sd = Join-Path $script:WzSiteRoot $siteName
-                if (-not (Test-Path -LiteralPath $sd -PathType Container)) {
-                    Write-Err "Row ${n} ($id): site folder not found: $sd"
-                    $bad = $true
-                } else {
-                    $srep = Get-SiteReport -Dir $sd
-                    if (-not $srep.Usable) {
-                        if (@($srep.Errors).Count -gt 0) {
-                            foreach ($e in $srep.Errors) { Write-Err "Row ${n} ($id): site '$siteName': $e" }
-                        } else {
-                            Write-Err "Row ${n} ($id): site folder '$siteName' has none of the expected files."
-                        }
-                        $bad = $true
-                    }
-                }
+                Write-Err "${tag}: site folder '$($r.Site)' has none of the expected files."
             }
+            $bad = $true
         }
-        $rows += [pscustomobject]@{ Id = $id; Site = $siteName }
     }
-    if ($first) { Write-Err 'The CSV file is empty.'; return $null }
-    if ($rows.Count -eq 0) { Write-Err 'The CSV has a header but no cards.'; return $null }
     if ($bad) { return $null }
-    return ,$rows
+    return ,@($list.Rows)
 }
 
 function Show-BatchSummary {
@@ -1684,10 +1689,10 @@ function Invoke-BatchMode {
     $doneCount = 0
     for ($i = 0; $i -lt $n; $i++) {
         $note = ''
-        if (Get-PriorUse -Id $rows[$i].Id) { $note = '  (already flashed before)'; $doneCount++ }
+        if (Get-PriorUse -Id $rows[$i].GatewayId) { $note = '  (already flashed before)'; $doneCount++ }
         $siteText = 'none'
         if ($rows[$i].Site) { $siteText = $rows[$i].Site }
-        Write-Say ('  {0,2}) {1,-24} site: {2}{3}' -f ($i + 1), $rows[$i].Id, $siteText, $note)
+        Write-Say ('  {0,2}) {1,-24} site: {2}{3}' -f ($i + 1), $rows[$i].GatewayId, $siteText, $note)
     }
     $skipDone = $false
     if ($doneCount -gt 0) {
@@ -1697,7 +1702,7 @@ function Invoke-BatchMode {
 
     $okN = 0; $failN = 0; $skipN = 0
     :cards for ($i = 0; $i -lt $n; $i++) {
-        $script:GwId = $rows[$i].Id
+        $script:GwId = $rows[$i].GatewayId
         $script:WzSite = $rows[$i].Site
         $script:WzSiteDir = ''
         if ($script:WzSite) { $script:WzSiteDir = Join-Path $script:WzSiteRoot $script:WzSite }
@@ -1864,11 +1869,12 @@ function Invoke-S3Provision {
         if ($script:SiteDir)   { Write-Warn '-SiteDir is ignored in batch mode (use -SiteFilesRoot with the CSV site column).' }
         if ($script:Site)      { Write-Warn '-Site is ignored in batch mode (the site comes from each CSV row).' }
 
-        $rows = @(Read-BatchCsv -Path $script:Batch)
-        if ($rows.Count -eq 0) { throw 'The batch CSV has no usable rows.' }
-        $check = Test-BatchPlan -Rows $rows
-        if (@($check.Errors).Count -gt 0) {
-            $check.Errors | ForEach-Object { Write-Bad "  $_" }
+        $list = Read-GatewayList -Path $script:Batch
+        $rows = @($list.Rows)
+        $check = Test-BatchSites -Rows $rows
+        $problems = @($list.Errors) + @($check.Errors)
+        if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Bad "  $_" }
             throw 'Fix the CSV problems above, then run again. Nothing was written.'
         }
         if (@($check.Warnings).Count -gt 0) {

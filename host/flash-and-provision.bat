@@ -37,4 +37,4 @@ exit /b 1
 :failed
 echo Could not start PowerShell as Administrator (was the Windows prompt cancelled?).
 pause
-exit /b 1
+exit /b 1

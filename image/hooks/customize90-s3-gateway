@@ -7,10 +7,15 @@
 # (systemd actually managing services, PostgreSQL actually accepting
 # connections) which a build-time chroot does not have:
 #   - create the PostgreSQL role/database/schema
-#   - set a real GATEWAY_ID
+#   - set a real GATEWAY_ID (unless GATEWAY_ID is given, see below)
 #   - install a site's samplelist.csv / pygw_conf.py
 #   - run s3-gateway-dbup
 # Those all happen at first boot instead - see image/firstboot/.
+#
+# GATEWAY_ID: left unset (the golden image), every card gets its ID from
+# host/flash-and-provision.sh. Set it (image/gateway-site-example.yaml, the
+# "one image per gateway" alternative) and it is baked in as
+# /etc/s3-gateway/provision.env, which first boot uses when the card has none.
 #
 # The local web admin (webadmin/ in the app source) IS installed here, mirroring
 # scripts/install-webadmin.sh. That script can't run in a build chroot as-is
@@ -39,7 +44,42 @@ TARGET_DIR="${S3_TARGET_DIR:-/opt/s3-gateway/app}"
 OPERATOR_USER="${S3_OPERATOR_USER:-pi}"
 OPERATOR_DIR="${S3_OPERATOR_DIR:-/home/pi/S3Gateway}"
 SERVICE_NAME="s3-zigbee-gateway"
+WEBADMIN_SERVICE="s3-gateway-webadmin"
+WEBADMIN_ENV="/etc/s3-gateway/webadmin.env"
+APP_ENV="$ROOTFS$TARGET_DIR/.env"
+SYSTEMD_DIR="$ROOTFS/etc/systemd/system"
+HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'    # same rule as first boot
 
+# --- helpers --------------------------------------------------------------------
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+in_chroot() { chroot "$ROOTFS" "$@"; }
+
+# require_source_files HINT FILE...   every FILE (relative to the app source) must exist
+require_source_files() {
+    local hint="$1" f
+    shift
+    for f in "$@"; do
+        if [ ! -e "$SRC/$f" ]; then
+            echo "ERROR: $SRC/$f is missing." >&2
+            echo "$hint" >&2
+            exit 1
+        fi
+    done
+}
+
+# set_kv FILE KEY VALUE   replace KEY=... in FILE (or append it); VALUE may hold / & | \
+set_kv() {
+    local file="$1" key="$2" value="$3" escaped
+    if grep -q "^${key}=" "$file"; then
+        escaped="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
+        sed -i "s|^${key}=.*|${key}=${escaped}|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+# --- pre-flight: fail here, in seconds, not after the apt/pip steps --------------
 if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
     echo "ERROR: $SRC does not look like the s3-zigbee-gateway source tree." >&2
     echo "Unzip your s3-zigbee-gateway.zip into image/s3-zigbee-gateway/ first." >&2
@@ -47,7 +87,7 @@ if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
     exit 1
 fi
 
-# --- first-boot pre-flight: the bundled dbup MUST honor S3_DBUP_SKIP_RESTART ---
+# The bundled dbup MUST honor S3_DBUP_SKIP_RESTART.
 # s3-gateway-firstboot.service is ordered Before= the gateway service. If dbup
 # calls `systemctl start s3-zigbee-gateway` from inside it, that start job waits
 # for first-boot to finish while first-boot waits for the start: a permanent
@@ -60,31 +100,18 @@ if ! grep -q 'S3_DBUP_SKIP_RESTART' "$SRC/scripts/s3-gateway-dbup"; then
     exit 1
 fi
 
-# --- web admin pre-flight: fail here, in seconds, not after the apt/pip steps ---
-WEBADMIN_SERVICE="s3-gateway-webadmin"
-for f in webadmin/app.py \
-         scripts/s3-gateway-envset \
-         deploy/systemd/s3-gateway-webadmin.service \
-         deploy/sudoers/s3-gateway-webadmin \
-         deploy/webadmin.env.example; do
-    if [ ! -e "$SRC/$f" ]; then
-        echo "ERROR: $SRC/$f is missing." >&2
-        echo "image/s3-zigbee-gateway/ does not contain the web admin - re-sync it from the current source tree." >&2
-        exit 1
-    fi
-done
+require_source_files "image/s3-zigbee-gateway/ does not contain the web admin - re-sync it from the current source tree." \
+    webadmin/app.py \
+    scripts/s3-gateway-envset \
+    deploy/systemd/s3-gateway-webadmin.service \
+    deploy/sudoers/s3-gateway-webadmin \
+    deploy/webadmin.env.example
 
-# --- log retention pre-flight: same idea ---
-for f in scripts/log-maintenance.sh \
-         deploy/systemd/s3-gateway-log-rotate.service \
-         deploy/systemd/s3-gateway-log-rotate.timer \
-         deploy/systemd/s3-gateway-log-maintenance.timer; do
-    if [ ! -e "$SRC/$f" ]; then
-        echo "ERROR: $SRC/$f is missing." >&2
-        echo "image/s3-zigbee-gateway/ does not contain the log retention service - re-sync it from the current source tree." >&2
-        exit 1
-    fi
-done
+require_source_files "image/s3-zigbee-gateway/ does not contain the log retention service - re-sync it from the current source tree." \
+    scripts/log-maintenance.sh \
+    deploy/systemd/s3-gateway-log-rotate.service \
+    deploy/systemd/s3-gateway-log-rotate.timer \
+    deploy/systemd/s3-gateway-log-maintenance.timer
 
 # The rotation config below writes finished days into log/rotated/. A log-maintenance.sh
 # from before the rotated/ + compressed/ layout would never compress or delete them.
@@ -94,11 +121,10 @@ if ! grep -q 'ROTATED_DIR' "$SRC/scripts/log-maintenance.sh"; then
     exit 1
 fi
 
-# --- localDBpath pre-flight: the node list is NOT always samplelist.csv ---------
-# The site's pygw_conf.py names it (localDBpath). The image seeds, first boot
-# installs and s3-gateway-dbup validates that file. A source tree from before
-# this change still hardcodes samplelist.csv in s3-gateway-dbup, so a site that
-# renames its list would fail at first boot.
+# The node list is NOT always samplelist.csv: the site's pygw_conf.py names it
+# (localDBpath). The image seeds, first boot installs and s3-gateway-dbup validates
+# that file. A source tree from before this change still hardcodes samplelist.csv in
+# s3-gateway-dbup, so a site that renames its list would fail at first boot.
 if ! grep -q 'read_local_db_name' "$SRC/scripts/s3-gateway-dbup" || [ ! -f "$SRC/scripts/lib/localdb.sh" ]; then
     echo "ERROR: $SRC predates localDBpath support (s3-gateway-dbup has no read_local_db_name, or scripts/lib/localdb.sh is missing)." >&2
     echo "Re-sync image/s3-zigbee-gateway/ from the current source tree (the one with localdbpath-fix applied)." >&2
@@ -106,14 +132,10 @@ if ! grep -q 'read_local_db_name' "$SRC/scripts/s3-gateway-dbup" || [ ! -f "$SRC
 fi
 # shellcheck disable=SC1091
 . "$SRC/scripts/lib/localdb.sh"
-NODE_LIST="$(s3_node_list_name "$SRC/PYSerialGateway/pygw_conf.py")" || {
-    echo "ERROR: the pygw_conf.py in the source tree has an unusable localDBpath (see above); the image would fail at first boot." >&2
-    exit 1
-}
-[ -f "$SRC/PYSerialGateway/samplelist.csv" ] || {
-    echo "ERROR: $SRC/PYSerialGateway/samplelist.csv (the placeholder node list) is missing." >&2
-    exit 1
-}
+NODE_LIST="$(s3_node_list_name "$SRC/PYSerialGateway/pygw_conf.py")" \
+    || die "the pygw_conf.py in the source tree has an unusable localDBpath (see above); the image would fail at first boot."
+[ -f "$SRC/PYSerialGateway/samplelist.csv" ] \
+    || die "$SRC/PYSerialGateway/samplelist.csv (the placeholder node list) is missing."
 
 WEBADMIN_PASSWORD="${S3_WEBADMIN_PASSWORD:-}"
 if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFORE-BUILDING" ]; then
@@ -122,6 +144,12 @@ if [ "${#WEBADMIN_PASSWORD}" -lt 8 ] || [ "$WEBADMIN_PASSWORD" = "CHANGE-ME-BEFO
     exit 1
 fi
 
+BAKED_GATEWAY_ID="${GATEWAY_ID:-}"
+if [ -n "$BAKED_GATEWAY_ID" ] && ! [[ $BAKED_GATEWAY_ID =~ $HOSTNAME_RE ]]; then
+    die "GATEWAY_ID '$BAKED_GATEWAY_ID' is not a valid hostname (letters, digits and '-', max 63, no leading/trailing '-')."
+fi
+
+# --- networking override ---------------------------------------------------------
 # NOTE: the wlan0 override below only matters while systemd-networkd is active.
 # NetworkManager takes over networking further down (see "Installing
 # NetworkManager"), so this file is inert; it is kept in case networkd is ever
@@ -141,8 +169,8 @@ echo "==> Ensuring required packages are installed"
 # present. Installing here explicitly is a real ordering requirement, not a
 # workaround for something broken; customize20-packages re-running its own
 # install later is a harmless no-op ("already the newest version").
-chroot "$ROOTFS" apt-get update
-chroot "$ROOTFS" apt-get install -y \
+in_chroot apt-get update
+in_chroot apt-get install -y \
     git rsync acl sudo usbutils iproute2 logrotate \
     python3 python3-venv python3.13-venv python3-pip \
     postgresql postgresql-client \
@@ -167,7 +195,7 @@ rsync -a \
     "$SRC/" "$ROOTFS$TARGET_DIR/"
 
 echo "==> Creating service account and Python venv inside the image"
-chroot "$ROOTFS" bash -c "
+in_chroot bash -c "
 set -euo pipefail
 id '$SERVICE_USER' >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin '$SERVICE_USER'
 usermod -a -G dialout '$SERVICE_USER'
@@ -179,20 +207,20 @@ python3 -m venv '$TARGET_DIR/.venv'
 "
 
 echo "==> Writing baseline .env (GATEWAY_ID left UNPROVISIONED on purpose)"
-cp "$ROOTFS$TARGET_DIR/.env.example" "$ROOTFS$TARGET_DIR/.env"
-sed -i "s/^DB_USER=.*/DB_USER=${SERVICE_USER}/" "$ROOTFS$TARGET_DIR/.env"
-sed -i "s/^GATEWAY_ID=.*/GATEWAY_ID=UNPROVISIONED/" "$ROOTFS$TARGET_DIR/.env"
-sed -i "s|^MQTT_LOG_FILE=.*|MQTT_LOG_FILE=${OPERATOR_DIR}/log/mqtt.log|" "$ROOTFS$TARGET_DIR/.env"
-sed -i "s|^GATEWAY_LOG_DIR=.*|GATEWAY_LOG_DIR=${OPERATOR_DIR}/log|" "$ROOTFS$TARGET_DIR/.env"
-sed -i "s|^GATEWAY_ERROR_LOG_DIR=.*|GATEWAY_ERROR_LOG_DIR=${OPERATOR_DIR}/log|" "$ROOTFS$TARGET_DIR/.env"
-# If your fleet shares one production broker/credentials, uncomment and edit:
-# sed -i "s/^MQTT_ENABLED=.*/MQTT_ENABLED=true/" "$ROOTFS$TARGET_DIR/.env"
-# sed -i "s/^MQTT_BROKER=.*/MQTT_BROKER=60.49.248.65/" "$ROOTFS$TARGET_DIR/.env"
-# sed -i "s/^MQTT_PORT=.*/MQTT_PORT=1884/" "$ROOTFS$TARGET_DIR/.env"
-# sed -i "s/^MQTT_USERNAME=.*/MQTT_USERNAME=otbr/" "$ROOTFS$TARGET_DIR/.env"
-# sed -i "s/^MQTT_PASSWORD=.*/MQTT_PASSWORD=senatraffic/" "$ROOTFS$TARGET_DIR/.env"
-chroot "$ROOTFS" chown root:"$SERVICE_USER" "$TARGET_DIR/.env"
-chroot "$ROOTFS" chmod 640 "$TARGET_DIR/.env"
+cp "$ROOTFS$TARGET_DIR/.env.example" "$APP_ENV"
+set_kv "$APP_ENV" DB_USER "$SERVICE_USER"
+set_kv "$APP_ENV" GATEWAY_ID UNPROVISIONED
+set_kv "$APP_ENV" MQTT_LOG_FILE "$OPERATOR_DIR/log/mqtt.log"
+set_kv "$APP_ENV" GATEWAY_LOG_DIR "$OPERATOR_DIR/log"
+set_kv "$APP_ENV" GATEWAY_ERROR_LOG_DIR "$OPERATOR_DIR/log"
+# If your fleet shares one production broker/credentials, set them here, e.g.:
+#   set_kv "$APP_ENV" MQTT_ENABLED true
+#   set_kv "$APP_ENV" MQTT_BROKER <broker host or IP>
+#   set_kv "$APP_ENV" MQTT_PORT <port>
+#   set_kv "$APP_ENV" MQTT_USERNAME <user>
+#   set_kv "$APP_ENV" MQTT_PASSWORD <password>
+in_chroot chown root:"$SERVICE_USER" "$TARGET_DIR/.env"
+in_chroot chmod 640 "$TARGET_DIR/.env"
 
 echo "==> Seeding operator workspace at $OPERATOR_DIR"
 install -d -m 755 "$ROOTFS$OPERATOR_DIR"
@@ -202,8 +230,10 @@ install -d -m 755 "$ROOTFS$OPERATOR_DIR"
 echo "    node list file (localDBpath): $NODE_LIST"
 install -m 644 "$SRC/PYSerialGateway/samplelist.csv" "$ROOTFS$OPERATOR_DIR/$NODE_LIST"
 install -m 644 "$SRC/PYSerialGateway/pygw_conf.py" "$ROOTFS$OPERATOR_DIR/pygw_conf.py"
-[ -f "$SRC/PYSerialGateway/README-OPERATOR.md" ] && install -m 644 "$SRC/PYSerialGateway/README-OPERATOR.md" "$ROOTFS$OPERATOR_DIR/README-OPERATOR.md"
-chroot "$ROOTFS" chown -R "${OPERATOR_USER}:${OPERATOR_USER}" "$OPERATOR_DIR"
+if [ -f "$SRC/PYSerialGateway/README-OPERATOR.md" ]; then
+    install -m 644 "$SRC/PYSerialGateway/README-OPERATOR.md" "$ROOTFS$OPERATOR_DIR/README-OPERATOR.md"
+fi
+in_chroot chown -R "${OPERATOR_USER}:${OPERATOR_USER}" "$OPERATOR_DIR"
 
 echo "==> Persisting operator identity for scripts that read /etc/s3-gateway/operator.conf"
 install -d -m 755 "$ROOTFS/etc/s3-gateway"
@@ -214,11 +244,17 @@ S3_OPERATOR_HOME=/home/$OPERATOR_USER
 S3_OPERATOR_DIR=$OPERATOR_DIR
 EOF
 
+if [ -n "$BAKED_GATEWAY_ID" ]; then
+    echo "==> Baking GATEWAY_ID=$BAKED_GATEWAY_ID into /etc/s3-gateway/provision.env (a card's own provision.env still wins)"
+    printf 'GATEWAY_ID=%s\n' "$BAKED_GATEWAY_ID" > "$ROOTFS/etc/s3-gateway/provision.env"
+    chmod 644 "$ROOTFS/etc/s3-gateway/provision.env"
+fi
+
 echo "==> Installing systemd units, GPSUP override, sudoers, dbup wrapper"
-install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway.service" "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service"
-install -d -m 755 "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d"
+install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway.service" "$SYSTEMD_DIR/${SERVICE_NAME}.service"
+install -d -m 755 "$SYSTEMD_DIR/${SERVICE_NAME}.service.d"
 install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
-    "$ROOTFS/etc/systemd/system/${SERVICE_NAME}.service.d/override.conf"
+    "$SYSTEMD_DIR/${SERVICE_NAME}.service.d/override.conf"
 # NOTE: s3-gateway-firstboot.service declares "Before=${SERVICE_NAME}.service"
 # (ordering only, no Requires=), so the gateway is held back until first-boot
 # has written GATEWAY_ID and initialised the DB, then starts by itself. The
@@ -227,7 +263,7 @@ install -m 644 "$SRC/deploy/systemd/s3-zigbee-gateway-gpsup.conf" \
 # is ordered Before= it (that deadlocks systemd - see the pre-flight above).
 
 install -m 440 "$SRC/deploy/sudoers/s3-gateway-hwreset" "$ROOTFS/etc/sudoers.d/s3-gateway-hwreset"
-chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-hwreset
+in_chroot visudo -cf /etc/sudoers.d/s3-gateway-hwreset
 
 install -m 755 "$SRC/scripts/s3-gateway-dbup" "$ROOTFS/usr/local/sbin/s3-gateway-dbup"
 
@@ -237,7 +273,7 @@ echo "==> Installing the log policy (mirrors install-log-retention.sh): midnight
 # Same content as install-log-retention.sh writes; "su" matches the ownership set
 # on the log dir/files further down (operator user, service group).
 rm -f "$ROOTFS/etc/logrotate.d/s3-gateway"
-install -d -m 755 "$ROOTFS/etc/s3-gateway" "$ROOTFS/var/lib/logrotate"
+install -d -m 755 "$ROOTFS/var/lib/logrotate"
 cat > "$ROOTFS/etc/s3-gateway/logrotate.conf" <<EOF
 # Written by customize90-s3-gateway. Run by s3-gateway-log-rotate.timer at 00:00:00.
 ${OPERATOR_DIR}/log/gateway.log
@@ -274,14 +310,11 @@ chmod 644 "$ROOTFS/etc/s3-gateway/logrotate.conf"
 chmod 640 "$ROOTFS/var/lib/logrotate/s3-gateway.status"
 
 install -m 755 "$SRC/scripts/log-maintenance.sh" "$ROOTFS/usr/local/sbin/s3-gateway-log-maintenance"
-install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.service" \
-    "$ROOTFS/etc/systemd/system/s3-gateway-log-rotate.service"
-install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.timer" \
-    "$ROOTFS/etc/systemd/system/s3-gateway-log-rotate.timer"
-install -m 644 "$SRC/deploy/systemd/s3-gateway-log-maintenance.timer" \
-    "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.timer"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.service" "$SYSTEMD_DIR/s3-gateway-log-rotate.service"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-rotate.timer" "$SYSTEMD_DIR/s3-gateway-log-rotate.timer"
+install -m 644 "$SRC/deploy/systemd/s3-gateway-log-maintenance.timer" "$SYSTEMD_DIR/s3-gateway-log-maintenance.timer"
 # Generated rather than copied: the repo's unit hard-codes /home/pi/S3Gateway/log.
-cat > "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service" <<EOF
+cat > "$SYSTEMD_DIR/s3-gateway-log-maintenance.service" <<EOF
 [Unit]
 Description=S3 Gateway log retention (compress after 7 days, delete after 3 months)
 
@@ -293,10 +326,10 @@ ExecStart=/usr/local/sbin/s3-gateway-log-maintenance
 Nice=10
 IOSchedulingClass=idle
 EOF
-chmod 644 "$ROOTFS/etc/systemd/system/s3-gateway-log-maintenance.service"
+chmod 644 "$SYSTEMD_DIR/s3-gateway-log-maintenance.service"
 
 echo "==> Privileged-path hardening (mirrors install-runtime-hardening.sh)"
-chroot "$ROOTFS" bash -c "
+in_chroot bash -c "
 set -euo pipefail
 chown root:root '$TARGET_DIR' '$TARGET_DIR/pyserialgateway'
 chmod 755 '$TARGET_DIR' '$TARGET_DIR/pyserialgateway'
@@ -308,7 +341,7 @@ rm -rf '$TARGET_DIR/pyserialgateway/__pycache__'
 echo "==> Configuring operator GPS access (log dir + GPSlog symlink)"
 install -d -m 2775 "$ROOTFS$OPERATOR_DIR/log"
 install -d -m 2775 "$ROOTFS$OPERATOR_DIR/GPSlog"
-chroot "$ROOTFS" bash -c "
+in_chroot bash -c "
 set -euo pipefail
 chown ${OPERATOR_USER}:${SERVICE_USER} '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
 setfacl -m u:${SERVICE_USER}:rwx '$OPERATOR_DIR/log' '$OPERATOR_DIR/GPSlog'
@@ -326,7 +359,7 @@ chown -h root:${SERVICE_USER} '$TARGET_DIR/PYSerialGateway/GPSlog'
 "
 
 echo "==> Symlinking in-app log dirs to the centralized operator log (hardware_reset.py writes here directly via a path relative to itself, not via GATEWAY_LOG_DIR)"
-chroot "$ROOTFS" bash -c "
+in_chroot bash -c "
 set -euo pipefail
 for d in '$TARGET_DIR/PYSerialGateway/log' '$TARGET_DIR/PYSerialGateway/errorlog' '$TARGET_DIR/pyserialgateway/log' '$TARGET_DIR/pyserialgateway/errorlog'; do
     rm -rf \"\$d\"
@@ -335,18 +368,15 @@ for d in '$TARGET_DIR/PYSerialGateway/log' '$TARGET_DIR/PYSerialGateway/errorlog
 done
 "
 
-: > "$ROOTFS$OPERATOR_DIR/log/gateway.log"
-: > "$ROOTFS$OPERATOR_DIR/log/error.log"
-: > "$ROOTFS$OPERATOR_DIR/log/mqtt.log"
-chroot "$ROOTFS" chown "${OPERATOR_USER}:${SERVICE_USER}" \
-    "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
-chroot "$ROOTFS" chmod 664 \
-    "$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log"
+LOG_FILES=("$OPERATOR_DIR/log/gateway.log" "$OPERATOR_DIR/log/error.log" "$OPERATOR_DIR/log/mqtt.log")
+for f in "${LOG_FILES[@]}"; do : > "$ROOTFS$f"; done
+in_chroot chown "${OPERATOR_USER}:${SERVICE_USER}" "${LOG_FILES[@]}"
+in_chroot chmod 664 "${LOG_FILES[@]}"
 
 # Same check install-log-retention.sh runs: a bad rotation config should fail the
 # build, not silently leave every unit with logs that never roll over. Debug mode
 # only parses and reports; it rotates nothing and the state file is discarded.
-if ! LR_CHECK="$(chroot "$ROOTFS" logrotate -d --state /tmp/s3-gateway-logrotate-check.status \
+if ! LR_CHECK="$(in_chroot logrotate -d --state /tmp/s3-gateway-logrotate-check.status \
         /etc/s3-gateway/logrotate.conf 2>&1)"; then
     echo "ERROR: logrotate rejected /etc/s3-gateway/logrotate.conf:" >&2
     echo "$LR_CHECK" >&2
@@ -357,42 +387,41 @@ rm -f "$ROOTFS/tmp/s3-gateway-logrotate-check.status"
 echo "==> Installing the first-boot provisioning service"
 install -d -m 755 "$ROOTFS/opt/s3-gateway/firstboot"
 install -m 755 "$FIRSTBOOT_SRC/s3-gateway-firstboot.sh" "$ROOTFS/opt/s3-gateway/firstboot/s3-gateway-firstboot.sh"
-install -m 644 "$FIRSTBOOT_SRC/s3-gateway-firstboot.service" "$ROOTFS/etc/systemd/system/s3-gateway-firstboot.service"
+install -m 644 "$FIRSTBOOT_SRC/s3-gateway-firstboot.service" "$SYSTEMD_DIR/s3-gateway-firstboot.service"
 install -d -m 750 "$ROOTFS/var/lib/s3-gateway"
-chroot "$ROOTFS" chown "$SERVICE_USER:$SERVICE_USER" /var/lib/s3-gateway
+in_chroot chown "$SERVICE_USER:$SERVICE_USER" /var/lib/s3-gateway
 
 echo "==> Installing the local web admin (${WEBADMIN_SERVICE})"
 # The webadmin/ package and its Python deps (Flask, waitress) are already in the
 # image from the rsync + pip steps above. What's left is what install-webadmin.sh
 # does: env file, sudo rule, systemd unit.
-WEBADMIN_ENV="/etc/s3-gateway/webadmin.env"
 
 # The service runs as the operator account, which must be able to read the package.
-chroot "$ROOTFS" chown -R root:"$SERVICE_USER" "$TARGET_DIR/webadmin"
-chroot "$ROOTFS" chmod -R go+rX,go-w "$TARGET_DIR/webadmin"
+in_chroot chown -R root:"$SERVICE_USER" "$TARGET_DIR/webadmin"
+in_chroot chmod -R go+rX,go-w "$TARGET_DIR/webadmin"
 
 # Same import check install-webadmin.sh runs: catches a missing dependency now
 # rather than as a crash-looping service on the unit.
-chroot "$ROOTFS" env PYTHONDONTWRITEBYTECODE=1 "$TARGET_DIR/.venv/bin/python" \
+in_chroot env PYTHONDONTWRITEBYTECODE=1 "$TARGET_DIR/.venv/bin/python" \
     -c "import sys; sys.path.insert(0, '$TARGET_DIR'); import webadmin.app"
 
 # Hash the build-time password with the image's own Werkzeug (what the app
 # verifies with). Passed on stdin so it never appears in a process list or needs
 # shell quoting.
-WEBADMIN_HASH="$(printf '%s' "$WEBADMIN_PASSWORD" | chroot "$ROOTFS" env PYTHONDONTWRITEBYTECODE=1 \
+WEBADMIN_HASH="$(printf '%s' "$WEBADMIN_PASSWORD" | in_chroot env PYTHONDONTWRITEBYTECODE=1 \
     "$TARGET_DIR/.venv/bin/python" -c \
     'import sys; from werkzeug.security import generate_password_hash; print(generate_password_hash(sys.stdin.read()))')"
 case "$WEBADMIN_HASH" in
     *'$'*'$'*) ;;   # werkzeug hashes look like  method:params$salt$digest
-    *) echo "ERROR: could not generate the web admin password hash" >&2; exit 1 ;;
+    *) die "could not generate the web admin password hash" ;;
 esac
 
-install -d -m 755 "$ROOTFS/etc/s3-gateway"
 install -m 600 "$SRC/deploy/webadmin.env.example" "$ROOTFS$WEBADMIN_ENV"
-chroot "$ROOTFS" chown root:root "$WEBADMIN_ENV"
-sed -i "s|^S3_WEBADMIN_PASSWORD_HASH=.*|S3_WEBADMIN_PASSWORD_HASH=${WEBADMIN_HASH}|" "$ROOTFS$WEBADMIN_ENV"
+in_chroot chown root:root "$WEBADMIN_ENV"
+set_kv "$ROOTFS$WEBADMIN_ENV" S3_WEBADMIN_PASSWORD_HASH "$WEBADMIN_HASH"
 grep -qxF "S3_WEBADMIN_PASSWORD_HASH=${WEBADMIN_HASH}" "$ROOTFS$WEBADMIN_ENV" \
-    || { echo "ERROR: failed to write the web admin password hash into $WEBADMIN_ENV" >&2; exit 1; }
+    || die "failed to write the web admin password hash into $WEBADMIN_ENV"
+
 # S3_WEBADMIN_SECRET_KEY is deliberately left empty here: the login cookies are
 # signed with it, so a key baked into a shared golden image would let anyone who
 # has the image forge a logged-in session on every gateway. Each unit generates
@@ -418,16 +447,12 @@ bash -n "$SRC/scripts/s3-gateway-envset"
 install -o root -g root -m 755 "$SRC/scripts/s3-gateway-envset" "$ROOTFS/usr/local/sbin/s3-gateway-envset"
 
 # systemctl path inside the image (what the Overview "Reboot" button is allowed to run).
-SYSTEMCTL_PATH="$(chroot "$ROOTFS" sh -c 'readlink -f "$(command -v systemctl)"')"
+SYSTEMCTL_PATH="$(in_chroot sh -c 'readlink -f "$(command -v systemctl)"')"
 case "$SYSTEMCTL_PATH" in
     /*/systemctl) ;;
-    *) echo "ERROR: could not find systemctl inside the image (got '$SYSTEMCTL_PATH')" >&2; exit 1 ;;
+    *) die "could not find systemctl inside the image (got '$SYSTEMCTL_PATH')" ;;
 esac
-if grep -q '^S3_REBOOT_COMMAND=' "$ROOTFS$WEBADMIN_ENV"; then
-    sed -i "s|^S3_REBOOT_COMMAND=.*|S3_REBOOT_COMMAND=sudo -n ${SYSTEMCTL_PATH} reboot|" "$ROOTFS$WEBADMIN_ENV"
-else
-    printf 'S3_REBOOT_COMMAND=sudo -n %s reboot\n' "$SYSTEMCTL_PATH" >> "$ROOTFS$WEBADMIN_ENV"
-fi
+set_kv "$ROOTFS$WEBADMIN_ENV" S3_REBOOT_COMMAND "sudo -n ${SYSTEMCTL_PATH} reboot"
 
 # The only privileges the web admin gets: passwordless sudo for s3-gateway-dbup (its
 # "Apply" button), s3-gateway-envset (the .env page) and the exact reboot command.
@@ -437,22 +462,21 @@ sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__SYSTEMCTL__|${SYSTEMCTL_
     > "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
 # Fail with a clear message if the template grows a placeholder this hook doesn't know about.
 if grep -nE '__[A-Z0-9_]+__' "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin" >&2; then
-    echo "ERROR: unsubstituted placeholder(s) left in s3-gateway-webadmin sudoers (see lines above)." >&2
     rm -f "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
-    exit 1
+    die "unsubstituted placeholder(s) left in s3-gateway-webadmin sudoers (see lines above)."
 fi
 chmod 440 "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
-chroot "$ROOTFS" chown root:root /etc/sudoers.d/s3-gateway-webadmin
-chroot "$ROOTFS" visudo -cf /etc/sudoers.d/s3-gateway-webadmin
+in_chroot chown root:root /etc/sudoers.d/s3-gateway-webadmin
+in_chroot visudo -cf /etc/sudoers.d/s3-gateway-webadmin
 
 sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__OPERATOR_DIR__|${OPERATOR_DIR}|g" \
     "$SRC/deploy/systemd/s3-gateway-webadmin.service" \
-    > "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service"
-chmod 644 "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service"
+    > "$SYSTEMD_DIR/${WEBADMIN_SERVICE}.service"
+chmod 644 "$SYSTEMD_DIR/${WEBADMIN_SERVICE}.service"
 # Drop-in (rather than editing the project's unit): systemd re-reads
 # EnvironmentFile after ExecStartPre, and "+" runs it as root despite User=.
-install -d -m 755 "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service.d"
-cat > "$ROOTFS/etc/systemd/system/${WEBADMIN_SERVICE}.service.d/10-initkey.conf" <<'EOF'
+install -d -m 755 "$SYSTEMD_DIR/${WEBADMIN_SERVICE}.service.d"
+cat > "$SYSTEMD_DIR/${WEBADMIN_SERVICE}.service.d/10-initkey.conf" <<'EOF'
 [Service]
 ExecStartPre=+/usr/local/sbin/s3-gateway-webadmin-initkey
 EOF
@@ -462,17 +486,16 @@ echo "==> Installing NetworkManager (takes over IP configuration from systemd-ne
 # USB serial ports and can corrupt traffic to the Zigbee module) and ppp. Ethernet
 # needs none of it. wpasupplicant is listed explicitly because it is only a
 # Recommends here and is wanted for optional Wi-Fi.
-chroot "$ROOTFS" apt-get install -y --no-install-recommends network-manager wpasupplicant
+in_chroot apt-get install -y --no-install-recommends network-manager wpasupplicant
 
 # Exactly one network manager may own the NIC. If networkd stayed active, both
 # would fight over eth0 (duplicate/flapping addresses). Mask rather than just
 # disable so nothing - socket activation, a base-layer unit, a later package -
 # can bring networkd back. The /etc/systemd/network/*.network files from the
 # base layer are left in place but are no longer read.
-systemctl --root="$ROOTFS" disable systemd-networkd.service systemd-networkd.socket \
-    systemd-networkd-wait-online.service >/dev/null 2>&1 || true
-systemctl --root="$ROOTFS" mask systemd-networkd.service systemd-networkd.socket \
-    systemd-networkd-wait-online.service
+NETWORKD_UNITS=(systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service)
+systemctl --root="$ROOTFS" disable "${NETWORKD_UNITS[@]}" >/dev/null 2>&1 || true
+systemctl --root="$ROOTFS" mask "${NETWORKD_UNITS[@]}"
 
 # Default Ethernet profile: DHCP on any wired NIC (no interface name is baked in,
 # so it works whether the NIC is called eth0 or end0). It exists so that
@@ -497,15 +520,14 @@ chown root:root "$NM_WIRED"
 chmod 600 "$NM_WIRED"
 
 echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
-systemctl --root="$ROOTFS" enable "${SERVICE_NAME}.service"
-systemctl --root="$ROOTFS" enable "${WEBADMIN_SERVICE}.service"
-systemctl --root="$ROOTFS" enable s3-gateway-firstboot.service
 # NetworkManager-wait-online is what makes network-online.target mean something
 # now that systemd-networkd-wait-online is masked.
-systemctl --root="$ROOTFS" enable NetworkManager.service
-systemctl --root="$ROOTFS" enable NetworkManager-wait-online.service
-systemctl --root="$ROOTFS" enable postgresql.service
-systemctl --root="$ROOTFS" enable s3-gateway-log-rotate.timer
-systemctl --root="$ROOTFS" enable s3-gateway-log-maintenance.timer
+for unit in "${SERVICE_NAME}.service" "${WEBADMIN_SERVICE}.service" \
+            s3-gateway-firstboot.service \
+            NetworkManager.service NetworkManager-wait-online.service \
+            postgresql.service \
+            s3-gateway-log-rotate.timer s3-gateway-log-maintenance.timer; do
+    systemctl --root="$ROOTFS" enable "$unit"
+done
 
 echo "==> customize90-s3-gateway complete"

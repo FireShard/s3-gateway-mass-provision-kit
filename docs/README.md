@@ -490,7 +490,7 @@ Example:
 cp image/gateway-site-example.yaml image/gateway-s3-gw-04.yaml
 ```
 
-Edit the gateway ID and hostname, then build:
+Edit `env.GATEWAY_ID` and the hostname, then build (the ID is baked in as `/etc/s3-gateway/provision.env`; a card's own `provision.env` still takes priority):
 
 ```bash
 ./rpi-image-gen build   -S image/   -c image/gateway-s3-gw-04.yaml
@@ -547,7 +547,11 @@ image/
 └── s3-zigbee-gateway/
 
 host/
-├── flash-and-provision.sh
+├── flash-and-provision.sh            (Linux flasher)
+├── flash-and-provision-wizard.sh     (Linux guided wizard)
+├── flash-and-provision.ps1 / .bat    (Windows flasher + wizard)
+├── lib/
+│   └── site-files.sh                 (shared by the two Linux scripts - keep it next to them)
 └── gateways.csv.example
 ```
 

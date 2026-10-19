@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================================
-# flash-wizard.sh - guided SD-card flashing for the S3 Zigbee Gateway image
+# flash-and-provision-wizard.sh - guided SD-card flashing for the S3 Zigbee Gateway image
 #
 # Just run it - no long commands, no options to remember:
 #
-#     ./host/flash-wizard.sh
+#     ./host/flash-and-provision-wizard.sh
 #
 # It asks you (one question at a time) for the golden image, the Gateway ID,
 # the site (if any) and the SD card, shows a summary, and then runs
@@ -39,13 +39,19 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LIB="$SCRIPT_DIR/lib/site-files.sh"
+if [ ! -r "$LIB" ]; then
+    echo "ERROR: $LIB is missing - keep the host/lib folder next to this script." >&2
+    exit 1
+fi
+# shellcheck source=lib/site-files.sh
+. "$LIB"
 FLASHER="$SCRIPT_DIR/flash-and-provision.sh"
 SITE_ROOT="$SCRIPT_DIR/site-files"
 LOG_FILE="$SCRIPT_DIR/flash-log.csv"
 LOG_HEADER="timestamp,operator,gateway_id,site,result,image,card_model,card_gb,device"
 MAX_CARD_GB=256                 # anything bigger is not offered as an SD card
 MIN_IMAGE_BYTES=$((16 * 1024 * 1024))
-ID_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
 
 IMAGE=""
 IMAGE_BYTES=0
@@ -56,7 +62,7 @@ LAST_SITE_DIR=""
 FLASHING=0
 LOG_OK=1
 
-usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { print_script_usage "${BASH_SOURCE[0]}"; exit 0; }
 
 # --- become root (the flasher writes to block devices) -----------------------
 if [ "$(id -u)" -ne 0 ]; then
@@ -94,20 +100,6 @@ warn() { printf '%sWARNING: %s%s\n' "$YELLOW" "$*" "$RESET"; }
 err()  { printf '%sERROR: %s%s\n' "$RED" "$*" "$RESET" >&2; }
 rule() { printf '  %s\n' "------------------------------------------------------------------"; }
 
-trim() {
-    local s="$1"
-    s="${s#"${s%%[![:space:]]*}"}"
-    s="${s%"${s##*[![:space:]]}"}"
-    printf '%s' "$s"
-}
-# Clean a path typed or drag-and-dropped into the terminal.
-clean_path() {
-    local s
-    s="$(trim "$1")"
-    s="${s#\'}"; s="${s%\'}"; s="${s#\"}"; s="${s%\"}"
-    s="${s//\\ / }"
-    printf '%s' "$s"
-}
 human() {
     if command -v numfmt >/dev/null 2>&1; then
         numfmt --to=si --suffix=B --format='%.1f' "$1" 2>/dev/null && return
@@ -262,7 +254,7 @@ ensure_image() {
     local -a found=()
     local i pick
     if [ -n "$IMAGE" ]; then
-        verify_image "$(clean_path "$IMAGE")" || { IMAGE=""; return 1; }
+        verify_image "$(clean_field "$IMAGE")" || { IMAGE=""; return 1; }
         return 0
     fi
     mapfile -t found < <(find_images)
@@ -282,13 +274,13 @@ ensure_image() {
         if [[ $pick =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#found[@]}" ]; then
             verify_image "${found[pick-1]}" && return 0
         else
-            verify_image "$(clean_path "$pick")" && return 0
+            verify_image "$(clean_field "$pick")" && return 0
         fi
     fi
     say "Type the path of the golden image (.img) file, or drag the file into this window."
     ask "Image file (or q to go back)"
     [ "$ANSWER" = "q" ] && return 1
-    verify_image "$(clean_path "$ANSWER")"
+    verify_image "$(clean_field "$ANSWER")"
 }
 
 # --- finding the SD card -----------------------------------------------------
@@ -367,7 +359,11 @@ wait_for_card() { # returns 1 if the user types q
     local shown=0 line rc
     while true; do
         scan_cards
-        if [ "${#CARD_DEV[@]}" -gt 0 ]; then sleep 1; scan_cards; return 0; fi
+        if [ "${#CARD_DEV[@]}" -gt 0 ]; then
+            sleep 1; scan_cards                    # let the reader settle, then re-check
+            [ "${#CARD_DEV[@]}" -gt 0 ] && return 0
+            continue
+        fi
         if [ "$shown" = 0 ]; then
             say "Insert the SD card into the card reader (and plug the reader into this computer)."
             say "Waiting for a card... (type q and press Enter to go back)"
@@ -395,7 +391,7 @@ pick_card() { # $1 = "flash" (needs room for the image) or "relabel"
             fi
         else
             say "Several possible SD cards were found:"
-            for i in $(seq 0 $((n - 1))); do printf '  %d) %s\n' "$((i + 1))" "$(card_line "$i")"; done
+            for ((i = 0; i < n; i++)); do printf '  %d) %s\n' "$((i + 1))" "$(card_line "$i")"; done
             ask "Choose the card number (r = look again, q = go back)"
             pick="$ANSWER"
             [ "$pick" = "q" ] && return 1
@@ -439,7 +435,7 @@ prompt_gateway_id() { # -> $GW_ID
         ask "Gateway ID" "$sug"
         GW_ID="$ANSWER"
         if [ -z "$GW_ID" ]; then err "The Gateway ID cannot be empty."; continue; fi
-        if ! [[ $GW_ID =~ $ID_RE ]]; then
+        if ! is_valid_gateway_id "$GW_ID"; then
             err "'$GW_ID' is not a valid Gateway ID. Use letters, numbers and '-' only (no spaces or underscores, no '-' at the start or end, max 63 characters)."
             continue
         fi
@@ -450,59 +446,6 @@ prompt_gateway_id() { # -> $GW_ID
         return 0
     done
 }
-site_csv_name() { # dir -> name of the node-list CSV the site's pygw_conf.py points at
-    # Same rule as s3-gateway-dbup (which runs at first boot and refuses a bad
-    # value): the LAST top-level `localDBpath = '<name>'` line wins and <name>
-    # is [A-Za-z0-9_.-], 1-60 characters, then .csv. No pygw_conf.py in the
-    # folder -> the image's own config is used -> samplelist.csv.
-    # flash-and-provision.sh repeats this check before it writes a card.
-    # Prints the name; on an unusable setting prints "ERROR: ..." and returns 1.
-    local d="$1" conf line name
-    local ok_re='^[A-Za-z0-9_.-]{1,60}\.csv$'
-    local lit_re="^localDBpath[[:space:]]*=[[:space:]]*(['\"])([^'\"\\\\]*)\\1[[:space:]]*(#.*)?$"
-    conf="$d/pygw_conf.py"
-    if [ ! -f "$conf" ]; then echo "samplelist.csv"; return 0; fi
-    line="$(tr -d '\r' < "$conf" | grep -E '^localDBpath[[:space:]]*=' | tail -n 1 || true)"
-    if [ -z "$line" ]; then
-        echo "ERROR: localDBpath is not set in pygw_conf.py (s3-gateway-dbup refuses a pygw_conf.py without it)."; return 1
-    fi
-    if ! [[ "$line" =~ $lit_re ]]; then
-        echo "ERROR: localDBpath in pygw_conf.py must be a plain quoted string such as 'samplelist.csv'."; return 1
-    fi
-    name="${BASH_REMATCH[2]}"
-    if ! [[ "$name" =~ $ok_re ]]; then
-        echo "ERROR: localDBpath '$name' in pygw_conf.py must be a plain file name ending in .csv (letters, digits, . _ - only, at most 60 characters before .csv, no folders)."; return 1
-    fi
-    echo "$name"
-}
-site_inspect() { # dir -> SITE_FOUND / SITE_MISSING / SITE_ERRORS ; returns 1 if the folder cannot be used
-    local d="$1" f csv
-    local -a zips=()
-    SITE_FOUND=(); SITE_MISSING=(); SITE_ERRORS=()
-    if csv="$(site_csv_name "$d")"; then
-        if [ -f "$d/$csv" ]; then
-            SITE_FOUND+=("$csv")
-        else
-            SITE_MISSING+=("$csv")
-            # The image only ships samplelist.csv. If pygw_conf.py names another file
-            # and it is not here, first boot would stop at s3-gateway-dbup.
-            if [ -f "$d/pygw_conf.py" ] && [ "$csv" != "samplelist.csv" ]; then
-                SITE_ERRORS+=("pygw_conf.py names the node list '$csv' but that file is not in this folder (the image only ships samplelist.csv, so first boot would stop at s3-gateway-dbup).")
-            fi
-        fi
-    else
-        SITE_ERRORS+=("${csv#ERROR: }")
-    fi
-    if [ -f "$d/pygw_conf.py" ]; then SITE_FOUND+=("pygw_conf.py"); else SITE_MISSING+=("pygw_conf.py"); fi
-    zips=("$d"/required-*gw.zip)
-    if [ -e "${zips[0]}" ]; then
-        for f in "${zips[@]}"; do SITE_FOUND+=("$(basename "$f")"); done
-    else
-        SITE_MISSING+=("required-*gw.zip")
-    fi
-    [ "${#SITE_ERRORS[@]}" -eq 0 ] && [ "${#SITE_FOUND[@]}" -gt 0 ]
-}
-join_by_comma() { local IFS=,; printf '%s' "$*" | sed 's/,/, /g'; }
 pick_site() { # -> $SITE, $SITE_DIR ; returns 1 to go back
     SITE=""; SITE_DIR=""
     local -a dirs=()
@@ -661,57 +604,23 @@ mode_relabel() {
     done
 }
 
-B_ID=(); B_SITE=()
-parse_batch_csv() { # file -> B_ID / B_SITE ; returns 1 if anything is wrong
-    local file="$1" line first=1 idcol=-1 sitecol=-1 i n=0 bad=0 id site seen=" " lc f
-    local -a cols=()
-    B_ID=(); B_SITE=()
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
-        if [ "$first" = 1 ]; then line="${line#$'\xef\xbb\xbf'}"; fi
-        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
-        IFS=, read -r -a cols <<< "$line"
-        for i in "${!cols[@]}"; do cols[i]="$(clean_path "${cols[i]}")"; done
-        if [ "$first" = 1 ]; then
-            for i in "${!cols[@]}"; do
-                case "${cols[i],,}" in
-                    gateway_id) idcol="$i" ;;
-                    site) sitecol="$i" ;;
-                esac
-            done
-            if [ "$idcol" -lt 0 ]; then
-                err "The first line of the CSV must be a header containing 'gateway_id' (for example: gateway_id,site,notes)."
-                return 1
+load_batch_csv() { # file -> B_ID / B_SITE ; returns 1 if anything is wrong (all problems are printed)
+    local i n site f bad=0
+    read_gateway_csv "$1" || bad=1
+    for i in "${!B_ID[@]}"; do
+        site="${B_SITE[i]}"; n=$((i + 1))
+        [ -n "$site" ] || continue
+        if [ ! -d "$SITE_ROOT/$site" ]; then
+            err "Row $n (${B_ID[i]}): site folder not found: $SITE_ROOT/$site"; bad=1
+        elif ! site_inspect "$SITE_ROOT/$site"; then
+            if [ "${#SITE_ERRORS[@]}" -gt 0 ]; then
+                for f in "${SITE_ERRORS[@]}"; do err "Row $n (${B_ID[i]}): site '$site': $f"; done
+            else
+                err "Row $n (${B_ID[i]}): site folder '$site' has none of the expected files."
             fi
-            first=0
-            continue
+            bad=1
         fi
-        n=$((n + 1))
-        id="${cols[idcol]:-}"; site=""
-        if [ "$sitecol" -ge 0 ]; then site="${cols[sitecol]:-}"; fi
-        lc="${id,,}"
-        if ! [[ $id =~ $ID_RE ]]; then
-            err "Row $n: '$id' is not a valid Gateway ID."; bad=1
-        elif [[ $seen == *" $lc "* ]]; then
-            err "Row $n: Gateway ID '$id' appears twice in the CSV."; bad=1
-        fi
-        seen="$seen$lc "
-        if [ -n "$site" ]; then
-            if [ ! -d "$SITE_ROOT/$site" ]; then
-                err "Row $n ($id): site folder not found: $SITE_ROOT/$site"; bad=1
-            elif ! site_inspect "$SITE_ROOT/$site"; then
-                if [ "${#SITE_ERRORS[@]}" -gt 0 ]; then
-                    for f in "${SITE_ERRORS[@]}"; do err "Row $n ($id): site '$site': $f"; done
-                else
-                    err "Row $n ($id): site folder '$site' has none of the expected files."
-                fi
-                bad=1
-            fi
-        fi
-        B_ID+=("$id"); B_SITE+=("$site")
-    done < "$file"
-    if [ "$first" = 1 ]; then err "The CSV file is empty."; return 1; fi
-    if [ "${#B_ID[@]}" -eq 0 ]; then err "The CSV has a header but no cards."; return 1; fi
+    done
     [ "$bad" = 0 ]
 }
 mode_batch() {
@@ -725,12 +634,12 @@ mode_batch() {
         ask "CSV file (type or drag it in, q = go back)"
     fi
     [ "$ANSWER" = "q" ] && return
-    csv="$(clean_path "$ANSWER")"
+    csv="$(clean_field "$ANSWER")"
     [ -f "$csv" ] || { err "File not found: $csv"; return; }
-    parse_batch_csv "$csv" || { say "Fix the problems above in the CSV and start again."; return; }
+    load_batch_csv "$csv" || { say "Fix the problems above in the CSV and start again."; return; }
     n="${#B_ID[@]}"
     say "The list has $n card(s):"
-    for i in $(seq 0 $((n - 1))); do
+    for ((i = 0; i < n; i++)); do
         act=""
         if prior_use "${B_ID[i]}" >/dev/null; then act="  (already flashed before)"; done_count=$((done_count + 1)); fi
         printf '  %2d) %-24s site: %s%s\n' "$((i + 1))" "${B_ID[i]}" "${B_SITE[i]:-none}" "$act"
@@ -739,7 +648,7 @@ mode_batch() {
         if ask_yn "$done_count card(s) were already flashed. Skip those?" Y; then skip_done=1; fi
     fi
     ask_yn "Start the batch?" Y || return
-    for i in $(seq 0 $((n - 1))); do
+    for ((i = 0; i < n; i++)); do
         GW_ID="${B_ID[i]}"; SITE="${B_SITE[i]}"; SITE_DIR=""
         [ -n "$SITE" ] && SITE_DIR="$SITE_ROOT/$SITE"
         if [ "$skip_done" = 1 ] && prior_use "$GW_ID" >/dev/null; then
@@ -803,19 +712,27 @@ main_menu() {
 }
 
 # --- start -------------------------------------------------------------------
-if [ ! -f "$FLASHER" ]; then
-    err "Cannot find flash-and-provision.sh next to this script ($FLASHER)."
-    exit 1
+main() {
+    if [ ! -f "$FLASHER" ]; then
+        err "Cannot find flash-and-provision.sh next to this script ($FLASHER)."
+        exit 1
+    fi
+    local tool
+    for tool in lsblk blockdev findmnt sha256sum od; do
+        command -v "$tool" >/dev/null 2>&1 || { err "Required tool not found: $tool"; exit 1; }
+    done
+    init_log
+    head1 "Welcome"
+    say "This wizard flashes the golden S3 Gateway image onto SD cards and gives"
+    say "each card its own Gateway ID. Before you start:"
+    say "  - plug in your SD card reader,"
+    say "  - have the Gateway IDs from your batch sheet ready,"
+    say "  - never remove a card while it is being written."
+    say "You can stop at any time with Ctrl+C."
+    main_menu
+}
+
+# Skipped when the file is sourced (which is how the functions above get tested).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main
 fi
-for tool in lsblk blockdev findmnt sha256sum od; do
-    command -v "$tool" >/dev/null 2>&1 || { err "Required tool not found: $tool"; exit 1; }
-done
-init_log
-head1 "Welcome"
-say "This wizard flashes the golden S3 Gateway image onto SD cards and gives"
-say "each card its own Gateway ID. Before you start:"
-say "  - plug in your SD card reader,"
-say "  - have the Gateway IDs from your batch sheet ready,"
-say "  - never remove a card while it is being written."
-say "You can stop at any time with Ctrl+C."
-main_menu
