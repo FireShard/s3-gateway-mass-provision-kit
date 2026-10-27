@@ -26,6 +26,16 @@
 #
 # gateways.csv format (header required): gateway_id,site
 #   ("#" comment lines, blank lines and Excel/Windows line endings are fine)
+#
+# ── Combined S3 + S5 image: pre-seed the two radios ───────────────────────
+# The combined image has two CP210x radios (the Zigbee dongle and the OpenThread RCP) that are told
+# apart by USB serial number. Give a card both serials and a new unit never has to probe them:
+#   sudo ./flash-and-provision.sh ... --gateway-id s3-gw-03 \
+#       --zigbee-serial 7a90707d748fed11a020e017b96ce6f8 --rcp-serial 5c11e0a9b3f24d7e8a0f6b2d1c9e4a77
+# In a batch, add optional columns:  gateway_id,site,zigbee_serial,rcp_serial
+# Both are optional and independent; leave them out for a plain S3 gateway. Generic serials (such as
+# 0001) and a serial used on two cards are refused before anything is written. Find a radio's serial with
+#   udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +50,8 @@ die() { err "$*"; exit 1; }
 IMAGE=""
 DEVICE=""
 GATEWAY_ID=""
+ZIGBEE_SERIAL=""
+RCP_SERIAL=""
 SITE_DIR=""
 SITE=""
 BATCH_CSV=""
@@ -53,12 +65,14 @@ usage() { print_script_usage "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --image|--device|--gateway-id|--site-dir|--site|--batch|--site-files-root)
+            --image|--device|--gateway-id|--zigbee-serial|--rcp-serial|--site-dir|--site|--batch|--site-files-root)
                 [ $# -ge 2 ] || die "$1 needs a value."
                 case "$1" in
                     --image)           IMAGE="$2" ;;
                     --device)          DEVICE="$2" ;;
                     --gateway-id)      GATEWAY_ID="$2" ;;
+                    --zigbee-serial)   ZIGBEE_SERIAL="$(clean_field "$2")" ;;
+                    --rcp-serial)      RCP_SERIAL="$(clean_field "$2")" ;;
                     --site-dir)        SITE_DIR="$2" ;;
                     --site)            SITE="$2" ;;
                     --batch)           BATCH_CSV="$2" ;;
@@ -84,12 +98,22 @@ validate_args() {
 
     if [ -n "$BATCH_CSV" ]; then
         [ -f "$BATCH_CSV" ] || die "batch CSV not found: $BATCH_CSV"
+        if [ -n "$ZIGBEE_SERIAL" ] || [ -n "$RCP_SERIAL" ]; then
+            echo "WARNING: --zigbee-serial / --rcp-serial are ignored in batch mode (the serials come from each CSV row)." >&2
+        fi
         return 0
     fi
 
     [ -n "$GATEWAY_ID" ] || die "--gateway-id or --batch CSV is required."
     is_valid_gateway_id "$GATEWAY_ID" \
         || die "'$GATEWAY_ID' is not a valid Gateway ID (letters, digits and '-' only, max 63 characters, no '-' at the start or end - it becomes the Pi's hostname)."
+
+    local problem bad=0
+    while IFS= read -r problem; do
+        [ -n "$problem" ] || continue
+        err "$problem."; bad=1
+    done < <(radio_serial_problems "$ZIGBEE_SERIAL" "$RCP_SERIAL")
+    [ "$bad" -eq 0 ] || die "Nothing was written. Fix the radio serial(s) above and run again."
 
     # --site-files-root only does anything together with --site (it picks
     # $SITE_FILES_ROOT/$SITE); say so instead of silently copying nothing.
@@ -193,8 +217,8 @@ copy_site_files() { # site_dir provision_dir
     done
 }
 
-provision_card() { # gateway_id site_dir
-    local gw_id="$1" site_dir="$2" bootpart pdir
+provision_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
+    local gw_id="$1" site_dir="$2" zb="${3:-}" rcp="${4:-}" bootpart pdir shown
     bootpart="$(boot_partition_of "$DEVICE")"
     [ -n "$bootpart" ] || die "could not find the boot partition on $DEVICE"
 
@@ -207,27 +231,30 @@ provision_card() { # gateway_id site_dir
     copy_site_files "$site_dir" "$pdir"
     # Written last: an interrupted run leaves a card with NO provision.env, which
     # first boot refuses loudly, instead of a half-provisioned one.
-    printf 'GATEWAY_ID=%s\n' "$gw_id" > "$pdir/provision.env"
+    provision_env_text "$gw_id" "$zb" "$rcp" > "$pdir/provision.env"
 
     sync
     umount "$MOUNT_POINT"
     rmdir "$MOUNT_POINT"
     MOUNT_POINT=""
-    echo "==> Wrote provision.env (GATEWAY_ID=$gw_id) to $bootpart"
+    shown="GATEWAY_ID=$gw_id"
+    if [ -n "$zb" ]; then shown="$shown, ZIGBEE_SERIAL=$zb"; fi
+    if [ -n "$rcp" ]; then shown="$shown, RCP_SERIAL=$rcp"; fi
+    echo "==> Wrote provision.env ($shown) to $bootpart"
 }
 
-do_one_card() { # gateway_id site_dir
-    local gw_id="$1" site_dir="$2"
+do_one_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
+    local gw_id="$1" site_dir="$2" zb="${3:-}" rcp="${4:-}"
     confirm_device
     if [ "$DO_FLASH" -eq 1 ]; then flash_image; fi
-    provision_card "$gw_id" "$site_dir"
+    provision_card "$gw_id" "$site_dir" "$zb" "$rcp"
     echo "==> Done: $DEVICE -> $gw_id"
 }
 
 # --- modes ---------------------------------------------------------------------
 run_single() {
     check_site "$SITE_DIR" "site files" || die "Nothing was written. Fix the site files above and run again."
-    do_one_card "$GATEWAY_ID" "$SITE_DIR"
+    do_one_card "$GATEWAY_ID" "$SITE_DIR" "$ZIGBEE_SERIAL" "$RCP_SERIAL"
 }
 
 run_batch() {
@@ -252,10 +279,13 @@ run_batch() {
         echo
         echo "############################################################"
         echo "# Card $((i + 1)) of $n: gateway_id=${B_ID[i]}  site=${B_SITE[i]:-<none>}"
+        if [ -n "${B_ZB[i]}${B_RCP[i]}" ]; then
+            echo "# radios: zigbee=${B_ZB[i]:-<probe>}  rcp=${B_RCP[i]:-<probe>}"
+        fi
         echo "# Insert the SD card as $DEVICE, then press Enter."
         echo "############################################################"
         read -r -p "> " _ || die "Input closed - stopped before card $((i + 1)) of $n (${B_ID[i]})."
-        do_one_card "${B_ID[i]}" "$site_dir"
+        do_one_card "${B_ID[i]}" "$site_dir" "${B_ZB[i]}" "${B_RCP[i]}"
     done
     echo
     echo "==> Batch complete: $n card(s)."

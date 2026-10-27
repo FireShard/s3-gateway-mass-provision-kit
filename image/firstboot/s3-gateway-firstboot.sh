@@ -305,6 +305,15 @@ main() {
 
     apply_env_overrides
     install_site_files "$provision_dir"
+
+    # Optional ZIGBEE_SERIAL= / RCP_SERIAL= (combined S3 + S5 image): lets radio-bind name the
+    # radios without probing. radio-bind parses the file itself and never overrides a role it has
+    # already identified. A problem here is logged, not fatal.
+    if [ -x /usr/local/sbin/radio-bind ]; then
+        /usr/local/sbin/radio-bind seed "$provision_dir/provision.env" --apply 2>&1 \
+            | while IFS= read -r line; do log "radio-bind: $line"; done \
+            || log "WARNING: radio-bind seeding reported a problem; radios will be probed instead"
+    fi
     set_gateway_hostname "$gateway_id"
     ensure_database
     run_dbup

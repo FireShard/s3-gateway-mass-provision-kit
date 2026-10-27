@@ -20,6 +20,8 @@
 #     otherwise be silently ignored);
 #   * batch mode from a CSV (comment lines and Excel/Windows line endings are
 #     fine) that skips cards already done;
+#   * on the combined S3 + S5 image, batch rows may carry zigbee_serial / rcp_serial columns; they are
+#     written to the card so the unit never has to probe its radios (see flash-and-provision.sh);
 #   * waits for you to remove each card before the next one (so a card can't be
 #     flashed twice by mistake);
 #   * keeps a record in host/flash-log.csv.
@@ -57,6 +59,8 @@ IMAGE=""
 IMAGE_BYTES=0
 IMAGE_OK=0
 LAST_ID=""
+CARD_ZB=""      # radio serials for the card being flashed: set per row in batch mode,
+CARD_RCP=""     # empty (nothing written) for a single card
 LAST_SITE=""
 LAST_SITE_DIR=""
 FLASHING=0
@@ -428,6 +432,7 @@ wait_for_removal() {
 # --- Gateway ID and site -----------------------------------------------------
 prompt_gateway_id() { # -> $GW_ID
     local sug="" prev
+    CARD_ZB=""; CARD_RCP=""       # a single card never inherits a batch row's serials
     sug="$(next_id "${LAST_ID:-$(last_logged_id)}" 2>/dev/null)"
     say "Gateway ID rules: letters, numbers and '-' only (for example s3-gw-03)."
     say "Every gateway needs its own, unique ID."
@@ -514,6 +519,9 @@ show_plan() { # mode id
     fi
     printf '   %-12s %s  %s  %s\n' "SD card" "$DEVICE" "$(human "$DEVICE_BYTES")" "$DEVICE_MODEL"
     printf '   %-12s %s\n' "Gateway ID" "$id"
+    if [ -n "$CARD_ZB$CARD_RCP" ]; then
+        printf '   %-12s zigbee %s, rcp %s\n' "Radios" "${CARD_ZB:-<probe>}" "${CARD_RCP:-<probe>}"
+    fi
     if [ -n "$SITE_DIR" ]; then
         site_inspect "$SITE_DIR"
         what="$SITE ($(join_by_comma "${SITE_FOUND[@]}"))"
@@ -531,6 +539,8 @@ run_flasher() { # mode id site_dir
     local -a args=(--device "$DEVICE" --gateway-id "$id")
     if [ "$mode" = "relabel" ]; then args+=(--no-flash); else args+=(--image "$IMAGE"); fi
     if [ -n "$site_dir" ]; then args+=(--site-dir "$site_dir"); fi
+    if [ -n "$CARD_ZB" ]; then args+=(--zigbee-serial "$CARD_ZB"); fi
+    if [ -n "$CARD_RCP" ]; then args+=(--rcp-serial "$CARD_RCP"); fi
     echo
     say "Starting. You will be asked to type the device path ($DEVICE) once more to confirm."
     FLASHING=1
@@ -604,7 +614,7 @@ mode_relabel() {
     done
 }
 
-load_batch_csv() { # file -> B_ID / B_SITE ; returns 1 if anything is wrong (all problems are printed)
+load_batch_csv() { # file -> B_ID / B_SITE / B_ZB / B_RCP ; returns 1 if anything is wrong (all problems are printed)
     local i n site f bad=0
     read_gateway_csv "$1" || bad=1
     for i in "${!B_ID[@]}"; do
@@ -642,6 +652,7 @@ mode_batch() {
     for ((i = 0; i < n; i++)); do
         act=""
         if prior_use "${B_ID[i]}" >/dev/null; then act="  (already flashed before)"; done_count=$((done_count + 1)); fi
+        if [ -n "${B_ZB[i]}${B_RCP[i]}" ]; then act="$act  [radio serials]"; fi
         printf '  %2d) %-24s site: %s%s\n' "$((i + 1))" "${B_ID[i]}" "${B_SITE[i]:-none}" "$act"
     done
     if [ "$done_count" -gt 0 ]; then
@@ -650,6 +661,7 @@ mode_batch() {
     ask_yn "Start the batch?" Y || return
     for ((i = 0; i < n; i++)); do
         GW_ID="${B_ID[i]}"; SITE="${B_SITE[i]}"; SITE_DIR=""
+        CARD_ZB="${B_ZB[i]}"; CARD_RCP="${B_RCP[i]}"
         [ -n "$SITE" ] && SITE_DIR="$SITE_ROOT/$SITE"
         if [ "$skip_done" = 1 ] && prior_use "$GW_ID" >/dev/null; then
             skip_n=$((skip_n + 1)); continue

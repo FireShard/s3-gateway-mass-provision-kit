@@ -327,6 +327,26 @@ The script will ask you to change the SD card between gateways.
 
 Each CSV row determines the gateway ID and site files.
 
+### Combined S3 + S5 image: radio serials
+
+On the combined image (S3 Zigbee + S5 OpenThread on one Pi) there are two USB radios, told apart by USB
+serial number. A card can carry both serials so a new unit never has to probe them. Add two optional
+columns to the CSV:
+
+```
+gateway_id,site,zigbee_serial,rcp_serial
+s3-gw-07,siteA,7a90707d748fed11a020e017b96ce6f8,5c11e0a9b3f24d7e8a0f6b2d1c9e4a77
+```
+
+or, for a single card: `--zigbee-serial ... --rcp-serial ...` (`-ZigbeeSerial` / `-RcpSerial` in
+`flash-and-provision.ps1`). The wizards use the CSV columns automatically. Both serials are optional and
+independent, and a plain S3 gateway simply leaves them out. They are written to the card's `provision.env`
+next to `GATEWAY_ID`; a plain S3 image ignores them.
+
+Mistakes are caught before anything is written: a serial with unusual characters, a generic one (such as
+`0001`, which many boards share), the same serial for both radios, or one serial on two cards. Find a radio's
+serial with `udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT`.
+
 ---
 
 # Provisioning rules

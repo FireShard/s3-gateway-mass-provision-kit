@@ -3,9 +3,10 @@
 # Source this file; it is not meant to be run.
 #
 #   Gateway IDs     GATEWAY_ID_RE, is_valid_gateway_id
+#   Radio serials   is_valid_radio_serial, is_weak_radio_serial, radio_serial_problems, provision_env_text
 #   Text clean-up   trim, clean_field
 #   Site folders    site_csv_name, site_problem, site_inspect
-#   Batch CSV       read_gateway_csv  ->  B_ID[] / B_SITE[]
+#   Batch CSV       read_gateway_csv  ->  B_ID[] / B_SITE[] / B_ZB[] / B_RCP[]
 #   Help text       print_script_usage
 #
 # The callers must define  err "message"  (print an error); a plain fallback is
@@ -29,6 +30,48 @@ if ! declare -F err >/dev/null; then
 fi
 
 is_valid_gateway_id() { [[ $1 =~ $GATEWAY_ID_RE ]]; }
+
+# --- radio serials (combined S3 + S5 image) ----------------------------------------
+# The combined image has two CP210x radios, told apart by USB serial number (radio-bind). A card may
+# carry both serials in provision.env (ZIGBEE_SERIAL / RCP_SERIAL) so a new unit never has to probe.
+# Both are optional. The rules are radio-bind's own, so a serial refused here would be refused there.
+RADIO_SERIAL_RE='^[A-Za-z0-9_.:-]{1,64}$'
+
+is_valid_radio_serial() { [[ $1 =~ $RADIO_SERIAL_RE ]]; }
+
+# Serials that cannot identify one radio: too short, one repeated character, or a known factory default
+# (many CP210x boards ship with 0001).
+is_weak_radio_serial() {
+    local s="${1,,}"
+    [ "${#s}" -lt 8 ] && return 0
+    [ -z "${s//"${s:0:1}"/}" ] && return 0
+    case "$s" in 0123456789|1234567890|0123456789abcdef|abcdef0123456789) return 0 ;; esac
+    return 1
+}
+
+# radio_serial_problems ZIGBEE RCP  prints one line per problem (nothing if both are fine or empty).
+radio_serial_problems() {
+    local zb="$1" rcp="$2" which value
+    for which in zigbee rcp; do
+        if [ "$which" = zigbee ]; then value="$zb"; else value="$rcp"; fi
+        [ -n "$value" ] || continue
+        if ! is_valid_radio_serial "$value"; then
+            echo "the $which serial '$value' is not a USB serial number (letters, digits and _ . : - only, up to 64 characters)"
+        elif is_weak_radio_serial "$value"; then
+            echo "the $which serial '$value' is too generic to identify one radio (many boards share it)"
+        fi
+    done
+    if [ -n "$zb" ] && [ "${zb,,}" = "${rcp,,}" ]; then
+        echo "the Zigbee and RCP serials are the same ('$zb'): they are two different radios"
+    fi
+}
+
+# provision_env_text GATEWAY_ID [ZIGBEE] [RCP]  the exact content of provision.env. LF line endings only.
+provision_env_text() {
+    printf 'GATEWAY_ID=%s\n' "$1"
+    if [ -n "${2:-}" ]; then printf 'ZIGBEE_SERIAL=%s\n' "$2"; fi
+    if [ -n "${3:-}" ]; then printf 'RCP_SERIAL=%s\n' "$3"; fi
+}
 
 # --- text clean-up -------------------------------------------------------------
 trim() {
@@ -143,17 +186,19 @@ site_inspect() {
 join_by_comma() { local IFS=,; printf '%s' "$*" | sed 's/,/, /g'; }
 
 # --- batch CSV -----------------------------------------------------------------
-# read_gateway_csv FILE  fills B_ID[] and B_SITE[] (same index = same card).
-# The first real line is the header and must contain "gateway_id" (optional "site").
+# read_gateway_csv FILE  fills B_ID[], B_SITE[], B_ZB[] and B_RCP[] (same index = same card).
+# The first real line is the header and must contain "gateway_id" (optional "site", and for the combined
+# S3 + S5 image "zigbee_serial" and "rcp_serial"; a serial must not appear on two cards).
 # Blank lines, "#" comment lines, a UTF-8 BOM, Excel/Windows line endings, quotes
 # and stray blanks are all fine. Every problem is reported with err; returns 1 if
 # there was any. Rows with a bad ID are still listed in B_ID so row numbers match
 # the file, so callers must not use the arrays when this fails.
 read_gateway_csv() {
-    local file="$1" line id site lower seen=" "
-    local header_done=0 id_col=-1 site_col=-1 row=0 bad=0 i
+    local file="$1" line id site zb rcp lower seen=" " problem key
+    local header_done=0 id_col=-1 site_col=-1 zb_col=-1 rcp_col=-1 row=0 bad=0 i
     local -a cols=()
-    B_ID=(); B_SITE=()
+    local -A serial_row=()
+    B_ID=(); B_SITE=(); B_ZB=(); B_RCP=()
 
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
@@ -168,6 +213,8 @@ read_gateway_csv() {
                 case "${cols[i],,}" in
                     gateway_id) id_col="$i" ;;
                     site)       site_col="$i" ;;
+                    zigbee_serial) zb_col="$i" ;;
+                    rcp_serial)    rcp_col="$i" ;;
                 esac
             done
             if [ "$id_col" -lt 0 ]; then
@@ -182,6 +229,9 @@ read_gateway_csv() {
         id="${cols[id_col]:-}"
         site=""
         if [ "$site_col" -ge 0 ]; then site="${cols[site_col]:-}"; fi
+        zb=""; rcp=""
+        if [ "$zb_col" -ge 0 ];  then zb="${cols[zb_col]:-}"; fi
+        if [ "$rcp_col" -ge 0 ]; then rcp="${cols[rcp_col]:-}"; fi
 
         lower="${id,,}"
         if ! is_valid_gateway_id "$id"; then
@@ -191,7 +241,20 @@ read_gateway_csv() {
         fi
         seen="$seen$lower "
 
-        B_ID+=("$id"); B_SITE+=("$site")
+        while IFS= read -r problem; do
+            [ -n "$problem" ] || continue
+            err "Row $row ($id): $problem."; bad=1
+        done < <(radio_serial_problems "$zb" "$rcp")
+        for key in "$zb" "$rcp"; do
+            [ -n "$key" ] || continue
+            if [ "${serial_row[${key,,}]:-$row}" != "$row" ]; then      # same row: already reported as "the same serial"
+                err "Row $row ($id): serial '$key' is already used on row ${serial_row[${key,,}]}: each radio has its own."; bad=1
+            else
+                serial_row[${key,,}]="$row"
+            fi
+        done
+
+        B_ID+=("$id"); B_SITE+=("$site"); B_ZB+=("$zb"); B_RCP+=("$rcp")
     done < "$file"
 
     if [ "$header_done" = 0 ]; then err "The CSV file is empty."; return 1; fi

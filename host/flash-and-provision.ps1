@@ -48,6 +48,13 @@
 .PARAMETER GatewayId
     GATEWAY_ID for this card, e.g. s3-gw-03. Letters, digits and '-' only,
     because it also becomes the Pi's hostname.
+.PARAMETER ZigbeeSerial
+    Combined S3 + S5 image only. USB serial number of this unit's Zigbee dongle, written to
+    provision.env so the unit never has to probe its radios. Optional; see -RcpSerial.
+.PARAMETER RcpSerial
+    Combined S3 + S5 image only. USB serial number of this unit's OpenThread RCP (the ESP32-C6).
+    Optional and independent of -ZigbeeSerial. Generic serials (such as 0001) are refused.
+    Find one with: udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
 .PARAMETER SiteDir
     Folder holding this gateway's site files, used exactly as given.
 .PARAMETER Site
@@ -56,7 +63,8 @@
     Folder containing one sub-folder per site. In the wizard the default is
     site-files next to this script.
 .PARAMETER Batch
-    CSV file (header: gateway_id,site) - one card per row, prompts between cards.
+    CSV file (header: gateway_id,site) - one card per row, prompts between cards. For the combined
+    S3 + S5 image, optional columns zigbee_serial and rcp_serial carry each unit's radio serials.
 .PARAMETER NoFlash
     Do not write the image. Only (re)write provision.env and the site files on
     a card that is already flashed.
@@ -107,6 +115,8 @@ param(
     [string]$Image,
     [int]$DiskNumber = -1,
     [string]$GatewayId,
+    [string]$ZigbeeSerial,
+    [string]$RcpSerial,
     [string]$SiteDir,
     [string]$Site,
     [string]$SiteFilesRoot,
@@ -125,6 +135,8 @@ $script:ChunkBytes       = 4MB
 $script:FlushEveryBytes  = 64MB
 # Same rule s3-gateway-firstboot.sh applies before it accepts GATEWAY_ID as a hostname.
 $script:GatewayIdPattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z'
+# Same rule radio-bind applies to the USB serial numbers it keys radios on.
+$script:RadioSerialPattern = '^[A-Za-z0-9_.:-]{1,64}\z'
 $script:CardBuses        = @('USB', 'SD', 'MMC')
 $script:GuardPaths       = @()
 $script:DiskFromParam    = $false
@@ -174,6 +186,52 @@ function Assert-GatewayId {
     if (-not (Test-GatewayId -Value $Value)) {
         throw "Invalid gateway ID '$Value'. Use letters, digits and '-' only (max 63 characters, no leading or trailing '-') - it becomes the Pi's hostname."
     }
+}
+
+function Test-RadioSerial {
+    param([string]$Value)
+    return ($Value -cmatch $script:RadioSerialPattern)
+}
+
+function Test-WeakRadioSerial {
+    # A serial that cannot identify one radio: too short, one repeated character, or a known factory
+    # default (many CP210x boards ship with 0001). Same rule as radio-bind.
+    param([string]$Value)
+    $s = $Value.ToLowerInvariant()
+    if ($s.Length -lt 8) { return $true }
+    if (@($s.ToCharArray() | Select-Object -Unique).Count -eq 1) { return $true }
+    return (@('0123456789', '1234567890', '0123456789abcdef', 'abcdef0123456789') -contains $s)
+}
+
+function Get-RadioSerialProblems {
+    # One message per problem; nothing when both serials are fine or empty.
+    param([string]$Zigbee = '', [string]$Rcp = '')
+    $problems = @()
+    $pairs = @(
+        [pscustomobject]@{ Which = 'zigbee'; Value = $Zigbee },
+        [pscustomobject]@{ Which = 'rcp'; Value = $Rcp }
+    )
+    foreach ($pair in $pairs) {
+        if (-not $pair.Value) { continue }
+        if (-not (Test-RadioSerial -Value $pair.Value)) {
+            $problems += "the $($pair.Which) serial '$($pair.Value)' is not a USB serial number (letters, digits and _ . : - only, up to 64 characters)"
+        } elseif (Test-WeakRadioSerial -Value $pair.Value) {
+            $problems += "the $($pair.Which) serial '$($pair.Value)' is too generic to identify one radio (many boards share it)"
+        }
+    }
+    if ($Zigbee -and $Rcp -and ($Zigbee.ToLowerInvariant() -eq $Rcp.ToLowerInvariant())) {
+        $problems += "the Zigbee and RCP serials are the same ('$Zigbee'): they are two different radios"
+    }
+    return $problems
+}
+
+function Get-ProvisionEnvText {
+    # The exact content of provision.env: LF line endings, ASCII. Radio serials only when given.
+    param([string]$Gw, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
+    $text = "GATEWAY_ID=$Gw`n"
+    if ($ZigbeeSerial) { $text += "ZIGBEE_SERIAL=$ZigbeeSerial`n" }
+    if ($RcpSerial)    { $text += "RCP_SERIAL=$RcpSerial`n" }
+    return $text
 }
 
 function Test-SiteName {
@@ -772,7 +830,7 @@ function Assert-FileBytes {
 
 function Write-ProvisionFiles {
     # Returns how many site files were copied.
-    param([string]$BootRoot, [string]$Gw, $Plan)
+    param([string]$BootRoot, [string]$Gw, $Plan, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
     $pdir = Join-Path $BootRoot $script:ProvisionDirName
     New-Item -ItemType Directory -Path $pdir -Force | Out-Null
 
@@ -806,11 +864,14 @@ function Write-ProvisionFiles {
     # provision.env (first boot refuses it loudly) instead of a half-provisioned one.
     # First boot SOURCES this file as root in bash, so it must be plain ASCII,
     # LF line endings and no BOM - never let PowerShell pick the encoding.
-    $envBytes = [Text.Encoding]::ASCII.GetBytes("GATEWAY_ID=$Gw`n")
+    $envBytes = [Text.Encoding]::ASCII.GetBytes((Get-ProvisionEnvText -Gw $Gw -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial))
     $envPath = Join-Path $pdir 'provision.env'
     [IO.File]::WriteAllBytes($envPath, $envBytes)
     Assert-FileBytes -Path $envPath -Expected $envBytes
-    Write-Step "Wrote provision.env (GATEWAY_ID=$Gw) to $BootRoot"
+    $shown = "GATEWAY_ID=$Gw"
+    if ($ZigbeeSerial) { $shown += ", ZIGBEE_SERIAL=$ZigbeeSerial" }
+    if ($RcpSerial)    { $shown += ", RCP_SERIAL=$RcpSerial" }
+    Write-Step "Wrote provision.env ($shown) to $BootRoot"
     return $copied
 }
 
@@ -818,7 +879,11 @@ function Write-ProvisionFiles {
 # One card
 # ---------------------------------------------------------------------------
 function Invoke-Card {
-    param([string]$Gw, [string]$SiteDirPath)
+    param([string]$Gw, [string]$SiteDirPath, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
+    $serialProblems = @(Get-RadioSerialProblems -Zigbee $ZigbeeSerial -Rcp $RcpSerial)
+    if ($serialProblems.Count -gt 0) {
+        throw ("The radio serials for $Gw cannot be used:`n  - " + ($serialProblems -join "`n  - ") + "`nNothing was written to the card.")
+    }
     $disk = Get-TargetDisk
     $plan = Get-SitePlan -Dir $SiteDirPath
     Show-SitePlan -Plan $plan
@@ -834,7 +899,7 @@ function Invoke-Card {
     $copied = 0
     $unmounted = $false
     try {
-        $copied = @(Write-ProvisionFiles -BootRoot $vol.Root -Gw $Gw -Plan $plan)[-1]
+        $copied = @(Write-ProvisionFiles -BootRoot $vol.Root -Gw $Gw -Plan $plan -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial)[-1]
     } finally {
         $unmounted = Dismount-BootVolume -Volume $vol -DiskNumber $disk.Number
     }
@@ -853,10 +918,12 @@ function Invoke-Card {
 # Batch CSV
 # ---------------------------------------------------------------------------
 function Read-GatewayList {
-    # Reads a batch CSV (header: gateway_id,site[,notes]). Blank lines, "#" comment lines,
-    # a BOM, Excel/Windows line endings, quotes and stray blanks are all fine.
-    # Returns Rows (Row, GatewayId, Site) and Errors (the file itself, or a Gateway ID that is
-    # invalid or listed twice). Rows with a bad ID are kept so row numbers match the file.
+    # Reads a batch CSV (header: gateway_id,site[,notes]; for the combined S3 + S5 image also the optional
+    # zigbee_serial and rcp_serial). Blank lines, "#" comment lines, a BOM, Excel/Windows line endings,
+    # quotes and stray blanks are all fine.
+    # Returns Rows (Row, GatewayId, Site, ZigbeeSerial, RcpSerial) and Errors (the file itself, a Gateway ID
+    # that is invalid or listed twice, a radio serial that is unusable or used on two cards). Rows with a
+    # bad ID are kept so row numbers match the file.
     param([string]$Path)
     $fail = { param($Message) return [pscustomobject]@{ Rows = @(); Errors = @($Message) } }
 
@@ -879,6 +946,8 @@ function Read-GatewayList {
     }
     $idName   = $headers | Where-Object { $_.ToLowerInvariant() -eq 'gateway_id' } | Select-Object -First 1
     $siteName = $headers | Where-Object { $_.ToLowerInvariant() -eq 'site' } | Select-Object -First 1
+    $zbName   = $headers | Where-Object { $_.ToLowerInvariant() -eq 'zigbee_serial' } | Select-Object -First 1
+    $rcpName  = $headers | Where-Object { $_.ToLowerInvariant() -eq 'rcp_serial' } | Select-Object -First 1
     if (-not $idName) {
         return (& $fail "The first line of the CSV must be a header containing 'gateway_id' (for example: gateway_id,site,notes).")
     }
@@ -890,6 +959,7 @@ function Read-GatewayList {
     $rows = @()
     $errors = @()
     $seen = @{}
+    $serialRow = @{}
     $n = 0
     foreach ($rec in $records) {
         $n++
@@ -903,7 +973,24 @@ function Read-GatewayList {
             $errors += "Row ${n}: Gateway ID '$id' appears twice in the CSV."
         }
         $seen[$key] = $true
-        $rows += [pscustomobject]@{ Row = $n; GatewayId = $id; Site = $site }
+
+        $zb = ''
+        $rcp = ''
+        if ($zbName)  { $zb  = ConvertTo-CleanField -Value ([string]$rec.$zbName) }
+        if ($rcpName) { $rcp = ConvertTo-CleanField -Value ([string]$rec.$rcpName) }
+        foreach ($problem in @(Get-RadioSerialProblems -Zigbee $zb -Rcp $rcp)) {
+            $errors += "Row ${n} ($id): $problem."
+        }
+        foreach ($serial in @($zb, $rcp)) {
+            if (-not $serial) { continue }
+            $sk = $serial.ToLowerInvariant()
+            if ($serialRow.ContainsKey($sk) -and ($serialRow[$sk] -ne $n)) {      # same row: already reported as "the same serial"
+                $errors += "Row ${n} ($id): serial '$serial' is already used on row $($serialRow[$sk]): each radio has its own."
+            } else {
+                $serialRow[$sk] = $n
+            }
+        }
+        $rows += [pscustomobject]@{ Row = $n; GatewayId = $id; Site = $site; ZigbeeSerial = $zb; RcpSerial = $rcp }
     }
     return [pscustomobject]@{ Rows = $rows; Errors = $errors }
 }
@@ -980,6 +1067,8 @@ $script:ImageOk       = $false
 $script:WzSiteRoot    = ''
 $script:WzSite        = ''
 $script:WzSiteDir     = ''
+$script:WzZigbeeSerial = ''                    # radio serials of the card in hand: set per row in batch mode,
+$script:WzRcpSerial   = ''                    # empty (nothing written) for a single card
 $script:GwId          = ''
 $script:Card          = $null
 $script:Cards         = @()
@@ -1430,6 +1519,8 @@ function Select-Card {
 # --- Gateway ID and site -----------------------------------------------------
 function Read-GatewayId {
     # Sets $script:GwId.
+    $script:WzZigbeeSerial = ''                  # a single card never inherits a batch row's serials
+    $script:WzRcpSerial = ''
     $base = $script:LastId
     if (-not $base) { $base = Get-LastLoggedId }
     $suggest = Get-NextId -Id $base
@@ -1522,6 +1613,11 @@ function Show-Plan {
     }
     Write-Say ('   {0,-12} Disk {1}  {2}  {3}' -f 'SD card', $c.Number, (Format-Size $c.Bytes), $c.Model)
     Write-Say ('   {0,-12} {1}' -f 'Gateway ID', $Id)
+    if ($script:WzZigbeeSerial -or $script:WzRcpSerial) {
+        $zbText = '<probe>'; if ($script:WzZigbeeSerial) { $zbText = $script:WzZigbeeSerial }
+        $rcpText = '<probe>'; if ($script:WzRcpSerial) { $rcpText = $script:WzRcpSerial }
+        Write-Say ('   {0,-12} zigbee {1}, rcp {2}' -f 'Radios', $zbText, $rcpText)
+    }
     $what = 'none - the defaults built into the image'
     if ($script:WzSiteDir) {
         $rep = Get-SitePlan -Dir $script:WzSiteDir
@@ -1544,7 +1640,7 @@ function Invoke-WizardCard {
     $script:Flashing = $true
     $ok = $false
     try {
-        [void](Invoke-Card -Gw $Id -SiteDirPath $script:WzSiteDir)
+        [void](Invoke-Card -Gw $Id -SiteDirPath $script:WzSiteDir -ZigbeeSerial $script:WzZigbeeSerial -RcpSerial $script:WzRcpSerial)
         $ok = $true
     } catch [System.Management.Automation.PipelineStoppedException] {
         throw
@@ -1704,6 +1800,8 @@ function Invoke-BatchMode {
     :cards for ($i = 0; $i -lt $n; $i++) {
         $script:GwId = $rows[$i].GatewayId
         $script:WzSite = $rows[$i].Site
+        $script:WzZigbeeSerial = $rows[$i].ZigbeeSerial
+        $script:WzRcpSerial = $rows[$i].RcpSerial
         $script:WzSiteDir = ''
         if ($script:WzSite) { $script:WzSiteDir = Join-Path $script:WzSiteRoot $script:WzSite }
         if ($skipDone -and (Get-PriorUse -Id $script:GwId)) { $skipN++; continue }
@@ -1868,6 +1966,7 @@ function Invoke-S3Provision {
         if ($script:GatewayId) { Write-Warn '-GatewayId is ignored in batch mode (the IDs come from the CSV).' }
         if ($script:SiteDir)   { Write-Warn '-SiteDir is ignored in batch mode (use -SiteFilesRoot with the CSV site column).' }
         if ($script:Site)      { Write-Warn '-Site is ignored in batch mode (the site comes from each CSV row).' }
+        if ($script:ZigbeeSerial -or $script:RcpSerial) { Write-Warn '-ZigbeeSerial / -RcpSerial are ignored in batch mode (the serials come from each CSV row).' }
 
         $list = Read-GatewayList -Path $script:Batch
         $rows = @($list.Rows)
@@ -1896,11 +1995,16 @@ function Invoke-S3Provision {
                 Write-Host ''
                 Write-Host ('#' * 62)
                 Write-Host "# Card $($i + 1) of $($rows.Count):  gateway_id=$($r.GatewayId)   site=$siteText"
+                if ($r.ZigbeeSerial -or $r.RcpSerial) {
+                    $zbText = '<probe>'; if ($r.ZigbeeSerial) { $zbText = $r.ZigbeeSerial }
+                    $rcpText = '<probe>'; if ($r.RcpSerial) { $rcpText = $r.RcpSerial }
+                    Write-Host "# radios: zigbee=$zbText   rcp=$rcpText"
+                }
                 Write-Host '# Insert the SD card, then press Enter.'
                 Write-Host ('#' * 62)
                 [void](Read-Line 'Press Enter when the card is in')
                 try {
-                    $res = Invoke-Card -Gw $r.GatewayId -SiteDirPath $siteDirPath
+                    $res = Invoke-Card -Gw $r.GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $r.ZigbeeSerial -RcpSerial $r.RcpSerial
                     $status = 'OK'
                     $files = [string]$res.SiteFiles
                     break
@@ -1925,6 +2029,10 @@ function Invoke-S3Provision {
     # ---- single card -----------------------------------------------------
     if (-not $script:GatewayId) { throw '-GatewayId or -Batch is required.' }
     Assert-GatewayId -Value $script:GatewayId
+    $serialProblems = @(Get-RadioSerialProblems -Zigbee $script:ZigbeeSerial -Rcp $script:RcpSerial)
+    if ($serialProblems.Count -gt 0) {
+        throw ("Invalid radio serial(s):`n  - " + ($serialProblems -join "`n  - ") + "`nNothing was written.")
+    }
 
     $siteDirPath = ''
     if ($script:SiteDir) { $siteDirPath = $script:SiteDir }
@@ -1936,7 +2044,7 @@ function Invoke-S3Provision {
         Write-Warn '-Site has no effect without -SiteFilesRoot. No site files will be copied.'
     }
 
-    [void](Invoke-Card -Gw $script:GatewayId -SiteDirPath $siteDirPath)
+    [void](Invoke-Card -Gw $script:GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $script:ZigbeeSerial -RcpSerial $script:RcpSerial)
     return 0
 }
 

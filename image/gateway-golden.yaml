@@ -77,6 +77,12 @@ env:
   S3_OPERATOR_USER: pi
   S3_OPERATOR_DIR: /home/pi/S3Gateway
   S3_DB_NAME: serial-gateway-program
+  # Combined S3 + S5 image only (needs radio-bind in the image): the fixed name of the Zigbee
+  # radio, which skips the /dev/ttyUSB* scan. Leave empty for a plain S3 gateway.
+  S3_GATEWAY_SERIAL_PORT: ""
+  # "no" = the build hook leaves networking alone (the combined S3 + S5 image lets the S5 hook own it).
+  # "yes" (default) = original behaviour: NetworkManager owns the NICs, systemd-networkd is masked.
+  S3_MANAGE_NETWORK: "yes"
   # Login password for the local web admin (http://<gateway>:8080/). Same for
   # every unit built from this image, like the pi password above. The hook
   # refuses to build if this is unset, under 8 characters, or left as the

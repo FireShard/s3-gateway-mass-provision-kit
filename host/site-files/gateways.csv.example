@@ -11,3 +11,14 @@ s3-gw-06,siteB,
 #   site-files/siteA/required-siteAgw.zip
 # Leave "site" empty to keep whatever samplelist.csv/pygw_conf.py is already
 # baked into the golden image's operator workspace.
+
+# Combined S3 + S5 image only: two optional columns carry each unit's radio USB serial numbers,
+# so a new unit never has to probe its radios. Both are optional and independent; leave them out
+# (or empty) for a plain S3 gateway. Find a serial with:
+#   udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+#
+#   gateway_id,site,zigbee_serial,rcp_serial
+#   s3-gw-07,siteA,7a90707d748fed11a020e017b96ce6f8,5c11e0a9b3f24d7e8a0f6b2d1c9e4a77
+#   s3-gw-08,siteA,,5c11e0a9b3f24d7e8a0f6b2d1c9e4a77
+#
+# Generic serials (such as 0001) and a serial used on two cards are refused before anything is written.

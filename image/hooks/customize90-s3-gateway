@@ -53,6 +53,12 @@ HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'    # same rule as fi
 # --- helpers --------------------------------------------------------------------
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# S3_MANAGE_NETWORK=no: leave networking entirely alone. Used by the combined S3 + S5 image, where
+# the S5 kit's policy (NetworkManager on the infra interface only, never on wpan0) is the one in
+# force. "yes" (default) is the original behaviour: NetworkManager owns every NIC, networkd is masked.
+MANAGE_NETWORK="${S3_MANAGE_NETWORK:-yes}"
+case "$MANAGE_NETWORK" in yes|no) ;; *) echo "ERROR: S3_MANAGE_NETWORK must be \"yes\" or \"no\" (got '$MANAGE_NETWORK')." >&2; exit 1 ;; esac
+
 in_chroot() { chroot "$ROOTFS" "$@"; }
 
 # require_source_files HINT FILE...   every FILE (relative to the app source) must exist
@@ -149,6 +155,7 @@ if [ -n "$BAKED_GATEWAY_ID" ] && ! [[ $BAKED_GATEWAY_ID =~ $HOSTNAME_RE ]]; then
     die "GATEWAY_ID '$BAKED_GATEWAY_ID' is not a valid hostname (letters, digits and '-', max 63, no leading/trailing '-')."
 fi
 
+if [ "$MANAGE_NETWORK" = yes ]; then
 # --- networking override ---------------------------------------------------------
 # NOTE: the wlan0 override below only matters while systemd-networkd is active.
 # NetworkManager takes over networking further down (see "Installing
@@ -160,6 +167,7 @@ cat >> "$ROOTFS/etc/systemd/network/02-wlan0.network" <<'EOF'
 [Link]
 RequiredForOnline=no
 EOF
+fi
 
 echo "==> Ensuring required packages are installed"
 # rpi-image-gen's own packages: section (in gateway-golden.yaml) DOES work,
@@ -213,6 +221,15 @@ set_kv "$APP_ENV" GATEWAY_ID UNPROVISIONED
 set_kv "$APP_ENV" MQTT_LOG_FILE "$OPERATOR_DIR/log/mqtt.log"
 set_kv "$APP_ENV" GATEWAY_LOG_DIR "$OPERATOR_DIR/log"
 set_kv "$APP_ENV" GATEWAY_ERROR_LOG_DIR "$OPERATOR_DIR/log"
+# Combined S3 + S5 image only: the fixed Zigbee port that radio-bind creates. Empty or "auto" (the
+# default) leaves the gateway's .env at "auto", i.e. the original port scan.
+GATEWAY_SERIAL_PORT="${S3_GATEWAY_SERIAL_PORT:-}"
+if [ -n "$GATEWAY_SERIAL_PORT" ] && [ "${GATEWAY_SERIAL_PORT,,}" != auto ]; then
+    [[ $GATEWAY_SERIAL_PORT =~ ^/dev/[A-Za-z0-9._-]+$ ]] \
+        || die "S3_GATEWAY_SERIAL_PORT must look like /dev/s3-zigbee (got '$GATEWAY_SERIAL_PORT')."
+    echo "==> Gateway serial port fixed at $GATEWAY_SERIAL_PORT (S3_GATEWAY_SERIAL_PORT)"
+    set_kv "$APP_ENV" S3_GATEWAY_SERIAL_PORT "$GATEWAY_SERIAL_PORT"
+fi
 # If your fleet shares one production broker/credentials, set them here, e.g.:
 #   set_kv "$APP_ENV" MQTT_ENABLED true
 #   set_kv "$APP_ENV" MQTT_BROKER <broker host or IP>
@@ -481,6 +498,7 @@ cat > "$SYSTEMD_DIR/${WEBADMIN_SERVICE}.service.d/10-initkey.conf" <<'EOF'
 ExecStartPre=+/usr/local/sbin/s3-gateway-webadmin-initkey
 EOF
 
+if [ "$MANAGE_NETWORK" = yes ]; then
 echo "==> Installing NetworkManager (takes over IP configuration from systemd-networkd)"
 # --no-install-recommends: network-manager RECOMMENDS modemmanager (which probes
 # USB serial ports and can corrupt traffic to the Zigbee module) and ppp. Ethernet
@@ -518,15 +536,21 @@ method=auto
 NMEOF
 chown root:root "$NM_WIRED"
 chmod 600 "$NM_WIRED"
+else
+    echo "==> S3_MANAGE_NETWORK=no: not touching NetworkManager / systemd-networkd (another hook owns networking)"
+fi
 
 echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
 # NetworkManager-wait-online is what makes network-online.target mean something
 # now that systemd-networkd-wait-online is masked.
-for unit in "${SERVICE_NAME}.service" "${WEBADMIN_SERVICE}.service" \
-            s3-gateway-firstboot.service \
-            NetworkManager.service NetworkManager-wait-online.service \
-            postgresql.service \
-            s3-gateway-log-rotate.timer s3-gateway-log-maintenance.timer; do
+ENABLE_UNITS=("${SERVICE_NAME}.service" "${WEBADMIN_SERVICE}.service" \
+              s3-gateway-firstboot.service \
+              postgresql.service \
+              s3-gateway-log-rotate.timer s3-gateway-log-maintenance.timer)
+if [ "$MANAGE_NETWORK" = yes ]; then
+    ENABLE_UNITS+=(NetworkManager.service NetworkManager-wait-online.service)
+fi
+for unit in "${ENABLE_UNITS[@]}"; do
     systemctl --root="$ROOTFS" enable "$unit"
 done
 
