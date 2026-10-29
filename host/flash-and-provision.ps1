@@ -714,7 +714,9 @@ function Get-SiteCsvName {
     $result = [pscustomobject]@{ Name = 'samplelist.csv'; Error = '' }
     $conf = Join-Path $Dir 'pygw_conf.py'
     if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) { return $result }
-    $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($conf))
+    # A UTF-8 BOM (Notepad, Excel) is invisible to Python and is removed when the file is copied to the
+    # card, so it must not hide the setting from the match below.
+    $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($conf)) -replace '^\uFEFF', ''
     $line = $null
     foreach ($l in ($text -split "`r?`n")) { if ($l -match '^localDBpath[ \t]*=') { $line = $l } }
     if ($null -eq $line) {
@@ -884,12 +886,26 @@ function Invoke-Card {
     if ($serialProblems.Count -gt 0) {
         throw ("The radio serials for $Gw cannot be used:`n  - " + ($serialProblems -join "`n  - ") + "`nNothing was written to the card.")
     }
-    $disk = Get-TargetDisk
     $plan = Get-SitePlan -Dir $SiteDirPath
+    # A site folder that was named but is missing or empty is an error, not something to skip quietly:
+    # a typo would otherwise flash the card with the image's sample node list (same rule as
+    # host/flash-and-provision.sh).
+    if ($plan.Dir) {
+        $unusable = @()
+        if (-not $plan.Exists) {
+            $unusable += "site folder not found: $($plan.Dir)"
+        } elseif ((@($plan.Items).Count -eq 0) -and (@($plan.Errors).Count -eq 0)) {
+            $unusable += "$($plan.Dir) has none of the expected files (node-list .csv, pygw_conf.py, required-*gw.zip)"
+        }
+        if ($unusable.Count -gt 0) {
+            throw ("The site files cannot be used:`n  - " + ($unusable -join "`n  - ") + "`nNothing was written to the card. Fix the site files and try again.")
+        }
+    }
     Show-SitePlan -Plan $plan
     if (@($plan.Errors).Count -gt 0) {
         throw ("The site files in $($plan.Dir) cannot be used:`n  - " + (@($plan.Errors) -join "`n  - ") + "`nNothing was written to the card. Fix the site files and try again.")
     }
+    $disk = Get-TargetDisk
     $fingerprint = Confirm-Disk -Disk $disk
 
     if (-not $script:NoFlash) { [void](Invoke-Flash -Disk $disk -Fingerprint $fingerprint) }
@@ -997,8 +1013,8 @@ function Read-GatewayList {
 
 function Test-BatchSites {
     # Command-line batch: checks the site folders named in the CSV before anything is flashed.
-    # A missing or empty folder is only a warning (the operator is asked whether to go on);
-    # site files that would break first boot are an error.
+    # A missing or empty folder, and site files that would break first boot, are errors (nothing is
+    # written). Only "the CSV names sites but -SiteFilesRoot was not given" is a warning.
     param($Rows)
     $errors = @()
     $warns = @()
@@ -1011,8 +1027,8 @@ function Test-BatchSites {
             $warns += "$tag - names site '$($r.Site)' but -SiteFilesRoot was not given, so no site files will be copied."
         } else {
             $p = Get-SitePlan -Dir (Join-Path $script:SiteFilesRoot $r.Site)
-            if (-not $p.Exists) { $warns += "$tag - site folder not found: $($p.Dir)" }
-            elseif ($p.Items.Count -eq 0) { $warns += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
+            if (-not $p.Exists) { $errors += "$tag - site folder not found: $($p.Dir)" }
+            elseif ((@($p.Items).Count -eq 0) -and (@($p.Errors).Count -eq 0)) { $errors += "$tag - no node-list .csv / pygw_conf.py / required-*gw.zip in $($p.Dir)" }
             else { foreach ($pe in @($p.Errors)) { $errors += "$tag - site '$($r.Site)': $pe" } }
         }
     }

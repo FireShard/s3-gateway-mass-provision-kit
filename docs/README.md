@@ -33,6 +33,7 @@ The image contains everything that is the same on every gateway:
 - Sudo rules
 - Log rotation
 - GPS permissions
+- Self-recovery: Pi hardware watchdog, systemd watchdog, `Restart=always`, reboot-on-kernel-panic
 - PostgreSQL software
 - Default/sample gateway files
 
@@ -410,6 +411,12 @@ Run the project's validation script:
 ```bash
 sudo bash /opt/s3-gateway/app/scripts/validate-handover.sh
 ```
+
+The validation has a **Self-recovery (watchdogs)** section. All of it should PASS: it proves the
+Pi will reset itself if it hangs and the gateway restarts itself if it crashes. If it reports
+`no /dev/watchdog`, the image was built without `dtparam=watchdog=on` in `config.txt` (see the
+warning in the build output). The gateway source tree's `docs/WATCHDOG.md` explains each check
+and how to bench-test it.
 
 The hostname is normally the same as the `GATEWAY_ID`.
 

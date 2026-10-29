@@ -127,6 +127,21 @@ if ! grep -q 'ROTATED_DIR' "$SRC/scripts/log-maintenance.sh"; then
     exit 1
 fi
 
+# Self-recovery (hardware watchdog + app watchdog + restart policy). Without these the Pi sits
+# hung until someone power-cycles it, and a gateway that crashes with exit 0 stays down.
+require_source_files "image/s3-zigbee-gateway/ does not contain the watchdog support - re-sync it from the current source tree." \
+    scripts/install-watchdog.sh \
+    deploy/watchdog/10-s3-gateway-watchdog.conf \
+    deploy/watchdog/90-s3-gateway-panic.conf \
+    deploy/watchdog/s3-gateway-watchdog.modules \
+    pyserialgateway/PYGatewayListener/sdnotify.py
+if ! grep -q '^WatchdogSec=' "$SRC/deploy/systemd/s3-zigbee-gateway.service" \
+   || ! grep -q '^Restart=always' "$SRC/deploy/systemd/s3-zigbee-gateway.service"; then
+    echo "ERROR: $SRC/deploy/systemd/s3-zigbee-gateway.service has no Restart=always / WatchdogSec=." >&2
+    echo "Re-sync image/s3-zigbee-gateway/ from the current source tree." >&2
+    exit 1
+fi
+
 # The node list is NOT always samplelist.csv: the site's pygw_conf.py names it
 # (localDBpath). The image seeds, first boot installs and s3-gateway-dbup validates
 # that file. A source tree from before this change still hardcodes samplelist.csv in
@@ -283,6 +298,15 @@ install -m 440 "$SRC/deploy/sudoers/s3-gateway-hwreset" "$ROOTFS/etc/sudoers.d/s
 in_chroot visudo -cf /etc/sudoers.d/s3-gateway-hwreset
 
 install -m 755 "$SRC/scripts/s3-gateway-dbup" "$ROOTFS/usr/local/sbin/s3-gateway-dbup"
+
+echo "==> Self-recovery: Pi hardware watchdog, systemd watchdog, panic=>reboot (scripts/install-watchdog.sh)"
+# One script serves both this offline build and a live Pi, so the two cannot drift apart.
+# ROOTFS= makes it write files only; nothing is applied to the build host. If the image has
+# no config.txt at this point it WARNS and carries on - then dtparam=watchdog=on must be added
+# to the boot partition by hand, and scripts/validate-handover.sh on the first unit will say so.
+ROOTFS="$ROOTFS" SERVICE_NAME="$SERVICE_NAME" bash "$SRC/scripts/install-watchdog.sh"
+[ -f "$ROOTFS/etc/systemd/system.conf.d/10-s3-gateway-watchdog.conf" ] \
+    || { echo "ERROR: the systemd watchdog drop-in was not written into the image." >&2; exit 1; }
 
 echo "==> Installing the log policy (mirrors install-log-retention.sh): midnight rotation + 09:00 retention"
 # Rotation config. Deliberately NOT in /etc/logrotate.d/: the distro's own daily

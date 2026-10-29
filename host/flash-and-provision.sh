@@ -27,6 +27,11 @@
 # gateways.csv format (header required): gateway_id,site
 #   ("#" comment lines, blank lines and Excel/Windows line endings are fine)
 #
+# ── Line endings of the site files ──────────────────────────────────────────
+# The node-list CSV and pygw_conf.py are copied the way flash-and-provision.ps1 copies them: a UTF-8 BOM
+# and Windows (CRLF) line endings are removed, because the gateway runs Linux. A file saved as UTF-16 is
+# refused before anything is written. --keep-line-endings copies both files byte for byte instead.
+#
 # ── Combined S3 + S5 image: pre-seed the two radios ───────────────────────
 # The combined image has two CP210x radios (the Zigbee dongle and the OpenThread RCP) that are told
 # apart by USB serial number. Give a card both serials and a new unit never has to probe them:
@@ -57,6 +62,7 @@ SITE=""
 BATCH_CSV=""
 SITE_FILES_ROOT=""
 DO_FLASH=1
+KEEP_LINE_ENDINGS=0
 
 MOUNT_POINT=""      # set while the card's boot partition is mounted (see cleanup)
 
@@ -80,6 +86,7 @@ parse_args() {
                 esac
                 shift 2 ;;
             --no-flash) DO_FLASH=0; shift ;;
+            --keep-line-endings) KEEP_LINE_ENDINGS=1; shift ;;
             -h|--help)  usage 0 ;;
             *) err "Unknown argument: $1"; usage 1 >&2 ;;
         esac
@@ -126,6 +133,22 @@ validate_args() {
 }
 
 # --- site folders --------------------------------------------------------------
+# check_text_encoding DIR LABEL  (after site_inspect) -> returns 1 if the node list or pygw_conf.py is
+# saved as UTF-16: the gateway cannot read it, and it cannot be converted safely. Skipped with --keep-line-endings.
+check_text_encoding() {
+    local dir="$1" label="$2" f sig
+    [ "$KEEP_LINE_ENDINGS" -eq 0 ] || return 0
+    for f in "${SITE_FOUND[@]}"; do
+        case "$f" in required-*gw.zip) continue ;; esac
+        sig="$(head -c 2 "$dir/$f" | od -An -tx1 | tr -d ' \n')"
+        if [ "$sig" = "fffe" ] || [ "$sig" = "feff" ]; then
+            err "$label: $f is saved as UTF-16 - re-save it as UTF-8 (plain CSV, or \"CSV UTF-8\" in Excel)."
+            return 1
+        fi
+    done
+    return 0
+}
+
 # check_site DIR LABEL  -> returns 1 (after printing why) if the folder cannot be used.
 # A named site folder that is missing or empty is an error, not something to skip
 # quietly: a typo would otherwise give the card the image's sample node list.
@@ -137,6 +160,7 @@ check_site() {
         return 1
     fi
     if site_inspect "$dir"; then
+        check_text_encoding "$dir" "$label" || return 1
         return 0
     fi
     if [ "${#SITE_ERRORS[@]}" -gt 0 ]; then
@@ -205,13 +229,23 @@ clear_provision_dir() {
     rm -f "$pdir"/provision.env "$pdir"/pygw_conf.py "$pdir"/*.csv "$pdir"/required-*gw.zip
 }
 
+# copy_text_file SRC DEST  removes a UTF-8 BOM and CRLF line endings (same result as the Windows script),
+# or copies byte for byte with --keep-line-endings.
+copy_text_file() {
+    if [ "$KEEP_LINE_ENDINGS" -eq 1 ]; then
+        cp "$1" "$2"
+    else
+        LC_ALL=C sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' "$1" > "$2"
+    fi
+}
+
 copy_site_files() { # site_dir provision_dir
     local site_dir="$1" pdir="$2" csv_name zip
     [ -n "$site_dir" ] || return 0
 
     csv_name="$(site_csv_name "$site_dir")"     # already validated by check_site
-    if [ -f "$site_dir/$csv_name" ]; then cp "$site_dir/$csv_name" "$pdir/$csv_name"; fi
-    if [ -f "$site_dir/pygw_conf.py" ]; then cp "$site_dir/pygw_conf.py" "$pdir/"; fi
+    if [ -f "$site_dir/$csv_name" ]; then copy_text_file "$site_dir/$csv_name" "$pdir/$csv_name"; fi
+    if [ -f "$site_dir/pygw_conf.py" ]; then copy_text_file "$site_dir/pygw_conf.py" "$pdir/pygw_conf.py"; fi
     for zip in "$site_dir"/required-*gw.zip; do
         if [ -e "$zip" ]; then cp "$zip" "$pdir/"; fi
     done

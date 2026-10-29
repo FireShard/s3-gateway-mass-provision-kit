@@ -264,6 +264,10 @@ sudo bash /opt/s3-gateway/app/scripts/validate-handover.sh
 
 Review the output for any failures.
 
+Look at the **Self-recovery (watchdogs)** section in particular. Every line must be `PASS`: it
+confirms the hardware watchdog is on, so a gateway that freezes will restart itself without anyone
+visiting the site. A `FAIL` there means the gateway is not ready for delivery.
+
 This is the main post-installation check before handing the gateway over for use.
 
 ### Step 6 — Check the first-boot log if something went wrong
@@ -340,6 +344,7 @@ Use this checklist for every gateway:
 [ ] Hostname matches Gateway ID
 [ ] s3-zigbee-gateway is active
 [ ] validate-handover.sh passes
+[ ] Self-recovery (watchdogs) section all PASS
 [ ] Site files verified (if applicable)
 [ ] Gateway recorded as completed
 ```
