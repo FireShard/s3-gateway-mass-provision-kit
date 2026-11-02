@@ -111,6 +111,7 @@ require_source_files "image/s3-zigbee-gateway/ does not contain the web admin - 
     scripts/s3-gateway-envset \
     deploy/systemd/s3-gateway-webadmin.service \
     deploy/sudoers/s3-gateway-webadmin \
+    deploy/sudoers/s3-gateway-webadmin-radios \
     deploy/webadmin.env.example
 
 require_source_files "image/s3-zigbee-gateway/ does not contain the log retention service - re-sync it from the current source tree." \
@@ -236,12 +237,13 @@ set_kv "$APP_ENV" GATEWAY_ID UNPROVISIONED
 set_kv "$APP_ENV" MQTT_LOG_FILE "$OPERATOR_DIR/log/mqtt.log"
 set_kv "$APP_ENV" GATEWAY_LOG_DIR "$OPERATOR_DIR/log"
 set_kv "$APP_ENV" GATEWAY_ERROR_LOG_DIR "$OPERATOR_DIR/log"
-# Combined S3 + S5 image only: the fixed Zigbee port that radio-bind creates. Empty or "auto" (the
+# Combined S3 + S5 image only: the fixed Zigbee port that radio-bind creates, or two of them
+# (/dev/s3-zigbee,/dev/s3-zigbee2) for a Pi with two Zigbee dongles. Empty or "auto" (the
 # default) leaves the gateway's .env at "auto", i.e. the original port scan.
 GATEWAY_SERIAL_PORT="${S3_GATEWAY_SERIAL_PORT:-}"
 if [ -n "$GATEWAY_SERIAL_PORT" ] && [ "${GATEWAY_SERIAL_PORT,,}" != auto ]; then
-    [[ $GATEWAY_SERIAL_PORT =~ ^/dev/[A-Za-z0-9._-]+$ ]] \
-        || die "S3_GATEWAY_SERIAL_PORT must look like /dev/s3-zigbee (got '$GATEWAY_SERIAL_PORT')."
+    [[ $GATEWAY_SERIAL_PORT =~ ^/dev/[A-Za-z0-9._-]+(,/dev/[A-Za-z0-9._-]+)?$ ]] \
+        || die "S3_GATEWAY_SERIAL_PORT must look like /dev/s3-zigbee, or /dev/s3-zigbee,/dev/s3-zigbee2 for two dongles (got '$GATEWAY_SERIAL_PORT')."
     echo "==> Gateway serial port fixed at $GATEWAY_SERIAL_PORT (S3_GATEWAY_SERIAL_PORT)"
     set_kv "$APP_ENV" S3_GATEWAY_SERIAL_PORT "$GATEWAY_SERIAL_PORT"
 fi
@@ -509,6 +511,21 @@ fi
 chmod 440 "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin"
 in_chroot chown root:root /etc/sudoers.d/s3-gateway-webadmin
 in_chroot visudo -cf /etc/sudoers.d/s3-gateway-webadmin
+
+# Overview page, Radios panel (radio-bind boxes): "Clear learned pins" and "Re-identify now" run
+# `sudo -n radio-bind ...`. Without this rule they fail with "sudo: a password is required".
+# Harmless where radio-bind is not installed: the panel is hidden and the commands do not exist.
+# Same rule and validation as install-webadmin.sh.
+sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" \
+    "$SRC/deploy/sudoers/s3-gateway-webadmin-radios" \
+    > "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin-radios"
+if grep -nE '__[A-Z0-9_]+__' "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin-radios" >&2; then
+    rm -f "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin-radios"
+    die "unsubstituted placeholder(s) left in s3-gateway-webadmin-radios sudoers (see lines above)."
+fi
+chmod 440 "$ROOTFS/etc/sudoers.d/s3-gateway-webadmin-radios"
+in_chroot chown root:root /etc/sudoers.d/s3-gateway-webadmin-radios
+in_chroot visudo -cf /etc/sudoers.d/s3-gateway-webadmin-radios
 
 sed -e "s|__OPERATOR_USER__|${OPERATOR_USER}|g" -e "s|__OPERATOR_DIR__|${OPERATOR_DIR}|g" \
     "$SRC/deploy/systemd/s3-gateway-webadmin.service" \
