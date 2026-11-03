@@ -5,7 +5,7 @@
 #   Gateway IDs     GATEWAY_ID_RE, is_valid_gateway_id
 #   Radio serials   is_valid_radio_serial, is_weak_radio_serial, radio_serial_problems, provision_env_text
 #   Text clean-up   trim, clean_field
-#   Site folders    site_csv_name, site_problem, site_inspect
+#   Site folders    site_csv_name, site_problem, node_list_problems, site_inspect
 #   Batch CSV       read_gateway_csv  ->  B_ID[] / B_SITE[] / B_ZB[] / B_RCP[]
 #   Help text       print_script_usage
 #
@@ -149,18 +149,96 @@ site_problem() {
     return 0
 }
 
+# node_list_problems FILE NAME  prints one line per duplicate in the node list (nothing when it is clean).
+# NAME is only used in the messages. s3-gateway-dbup runs on the Pi at first boot and stops on a
+# duplicate node ID or pole ID (scripts/s3-gateway-dbup), after the card is already written; this finds
+# the same mistakes before. Line numbers are the file's own (the header is line 1, as in a text editor
+# or Excel). Checked:
+#   - the same node ID twice            dbup stops: "duplicate node ID"
+#   - the same pole_node twice          dbup stops: "duplicate pole ID"
+#   - 2a01 and 2A01 (same ID, other letter case)
+#                                       dbup lets it through but the node is registered twice
+# Values are trimmed like dbup trims them. An empty node/pole cell is not a duplicate (dbup reports
+# an incomplete row for it). The header must be exactly pole_node,node,pan_id,channel, as dbup demands;
+# without it the columns cannot be told apart, so that is reported instead. A UTF-16 file is skipped here:
+# check_text_encoding gives the proper message for it. At most 10 lines are printed, then a count.
+node_list_problems() {
+    local file="$1" name="${2:-$1}" sig
+    [ -f "$file" ] || return 0
+    sig="$(head -c 2 "$file" | od -An -tx1 | tr -d ' \n')"
+    if [ "$sig" = "fffe" ] || [ "$sig" = "feff" ]; then return 0; fi
+
+    LC_ALL=C awk -v name="$name" -v limit=10 '
+    function split_csv(s,    n, i, c, cur, inq, start) {
+        n = 0; cur = ""; inq = 0; start = 1
+        for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (inq) {
+                if (c == "\"") {
+                    if (substr(s, i + 1, 1) == "\"") { cur = cur "\""; i++ }
+                    else inq = 0
+                } else cur = cur c
+            } else if (c == "\"" && start) { inq = 1; start = 0 }
+            else if (c == ",") { F[++n] = cur; cur = ""; start = 1 }
+            else { cur = cur c; start = 0 }
+        }
+        F[++n] = cur
+        return n
+    }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function report(msg) { found++; if (found <= limit) print name " line " NR ": " msg }
+    { line = $0; sub(/\r$/, "", line) }
+    NR == 1 && substr(line, 1, 3) == "\357\273\277" { line = substr(line, 4) }
+    line ~ /^[ \t,]*$/ { next }
+    !header_done {
+        header_done = 1
+        n = split_csv(line); joined = F[1]
+        for (i = 2; i <= n; i++) joined = joined "," F[i]
+        if (joined != "pole_node,node,pan_id,channel") {
+            print name " line " NR ": the header must be exactly pole_node,node,pan_id,channel (s3-gateway-dbup refuses any other header, so duplicates cannot be checked)."
+            header_bad = 1; exit
+        }
+        next
+    }
+    {
+        split_csv(line)
+        pole = trim(F[1]); node = trim(F[2])
+        if (node != "") {
+            if (node in seen_node) {
+                report("node ID " node " is already used on line " seen_node[node] " (s3-gateway-dbup stops on a duplicate node ID).")
+            } else if (tolower(node) in fold_node) {
+                report("node ID " node " is the same ID as " fold_text[tolower(node)] " on line " fold_node[tolower(node)] " in a different letter case; s3-gateway-dbup lets it through but the node would be registered twice.")
+            } else {
+                seen_node[node] = NR; fold_node[tolower(node)] = NR; fold_text[tolower(node)] = node
+            }
+        }
+        if (pole != "") {
+            if (pole in seen_pole) report("pole ID " pole " is already used on line " seen_pole[pole] " (s3-gateway-dbup stops on a duplicate pole ID).")
+            else seen_pole[pole] = NR
+        }
+    }
+    END {
+        if (!header_bad && found > limit) print name ": ... and " (found - limit) " more duplicate(s) not listed."
+    }' "$file"
+}
+
 # site_inspect DIR  fills SITE_FOUND[] (files that will be installed), SITE_MISSING[]
 # (expected files that are absent; the image default is kept) and SITE_ERRORS[]
-# (things that would break first boot). Returns 1 if the folder cannot be used:
+# (things that would break first boot, including duplicate nodes in the node list:
+# see node_list_problems). Returns 1 if the folder cannot be used:
 # it has errors, or none of the expected files.
 site_inspect() {
-    local d="$1" csv zip
+    local d="$1" csv zip problem
     local -a zips=()
     SITE_FOUND=(); SITE_MISSING=(); SITE_ERRORS=()
 
     if csv="$(site_csv_name "$d")"; then
         if [ -f "$d/$csv" ]; then
             SITE_FOUND+=("$csv")
+            while IFS= read -r problem; do
+                [ -n "$problem" ] || continue
+                SITE_ERRORS+=("$problem")
+            done < <(node_list_problems "$d/$csv" "$csv")
         else
             SITE_MISSING+=("$csv")
             if [ -f "$d/pygw_conf.py" ] && [ "$csv" != "$DEFAULT_NODE_LIST" ]; then

@@ -263,6 +263,15 @@ The flasher applies the same rule as `s3-gateway-dbup`, because DBUP stops first
 - If there is no `pygw_conf.py` in the site folder, the image's own config is used and the list is `samplelist.csv`.
 - If the site folder breaks the rule, or `pygw_conf.py` names a list that is not in the folder (and it is not `samplelist.csv`), the flasher **refuses the card and writes nothing**. In a batch it checks every site before the first card. A card written with such files would stop at DBUP on every boot until someone fixed it by hand.
 
+The flasher also reads the node-list CSV itself and refuses the card if the same node appears twice, because `s3-gateway-dbup` would stop on it at first boot (after the card is already written). It checks:
+
+- **The same node ID on two lines** (DBUP stops: "duplicate node ID").
+- **The same `pole_node` on two lines** (DBUP stops: "duplicate pole ID").
+- **The same node ID in a different letter case**, such as `2a01` and `2A01`. DBUP lets this through, but the node would be registered twice.
+- **A wrong header.** It must be exactly `pole_node,node,pan_id,channel`; DBUP refuses anything else, and without it the columns cannot be told apart.
+
+Each problem is reported with the file's own line number (the header is line 1, as in Excel or a text editor), for example `samplelist.csv line 4: node ID 7468 is already used on line 3`. Spaces around values, quotes, a BOM, Windows line endings and empty `,,,` rows are ignored, the same way DBUP ignores them. An empty node or pole cell is not counted as a duplicate (DBUP reports it as an incomplete row). At most 10 problems are listed, followed by a count. The check runs in the Linux flasher, the guided wizard (single card and batch) and the Windows flasher, and nothing is written to any card until the list is fixed.
+
 If provided, they replace the default files in the image before the database setup runs.
 
 ## Option A — One site folder

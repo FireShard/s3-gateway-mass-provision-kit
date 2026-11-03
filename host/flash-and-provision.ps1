@@ -737,6 +737,76 @@ function Get-SiteCsvName {
     return $result
 }
 
+function Get-NodeListProblems {
+    # One message per duplicate in the node list (an empty array when it is clean). Same rule, same wording
+    # as node_list_problems in lib/site-files.sh. s3-gateway-dbup runs on the Pi at first boot and stops
+    # on a duplicate node ID or pole ID (scripts/s3-gateway-dbup), after the card is already written; this
+    # finds the same mistakes before. Line numbers are the file's own (the header is line 1, as in a text
+    # editor or Excel). Checked:
+    #   - the same node ID twice          dbup stops: "duplicate node ID"
+    #   - the same pole_node twice        dbup stops: "duplicate pole ID"
+    #   - 2a01 and 2A01 (same ID, other letter case): dbup lets it through but the node is registered twice
+    # Values are trimmed like dbup trims them. An empty node/pole cell is not a duplicate (dbup reports an
+    # incomplete row for it). The header must be exactly pole_node,node,pan_id,channel, as dbup demands;
+    # without it the columns cannot be told apart, so that is reported instead. A UTF-16 file is skipped
+    # here: ConvertTo-LfText gives the proper message for it. At most 10 are listed, then a count.
+    param([string]$Path, [string]$Name)
+    $limit = 10
+    $out = New-Object System.Collections.Generic.List[string]
+    $found = 0
+    try { $bytes = [IO.File]::ReadAllBytes($Path) }
+    catch { return @("cannot read ${Name}: $($_.Exception.Message) (is it open in Excel? close it and try again)") }
+    if (($bytes.Length -ge 2) -and ((($bytes[0] -eq 0xFF) -and ($bytes[1] -eq 0xFE)) -or (($bytes[0] -eq 0xFE) -and ($bytes[1] -eq 0xFF)))) { return @() }
+    $text = [Text.Encoding]::UTF8.GetString($bytes) -replace '^\uFEFF', ''
+    $splitter = ',(?=(?:[^"]*"[^"]*")*[^"]*$)'     # a comma that is not inside "quotes"
+    $seenNode = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([StringComparer]::Ordinal)
+    $seenPole = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([StringComparer]::Ordinal)
+    $foldNode = @{}                                # case-insensitive: first spelling and its line
+    $headerDone = $false
+    $lineNo = 0
+    foreach ($line in ($text -split "`r?`n")) {
+        $lineNo++
+        if ($line -match '^[ \t,]*$') { continue }
+        $cols = @([regex]::Split($line, $splitter) | ForEach-Object {
+            $c = $_
+            if ($c.Length -ge 2 -and $c.StartsWith('"') -and $c.EndsWith('"')) { $c = $c.Substring(1, $c.Length - 2).Replace('""', '"') }
+            $c
+        })
+        if (-not $headerDone) {
+            $headerDone = $true
+            if (($cols -join ',') -cne 'pole_node,node,pan_id,channel') {
+                return @("$Name line ${lineNo}: the header must be exactly pole_node,node,pan_id,channel (s3-gateway-dbup refuses any other header, so duplicates cannot be checked).")
+            }
+            continue
+        }
+        $pole = ''; $node = ''
+        if ($cols.Count -ge 1) { $pole = $cols[0].Trim() }
+        if ($cols.Count -ge 2) { $node = $cols[1].Trim() }
+        if ($node) {
+            if ($seenNode.ContainsKey($node)) {
+                $found++
+                if ($found -le $limit) { $out.Add("$Name line ${lineNo}: node ID $node is already used on line $($seenNode[$node]) (s3-gateway-dbup stops on a duplicate node ID).") }
+            } elseif ($foldNode.ContainsKey($node)) {
+                $found++
+                if ($found -le $limit) { $out.Add("$Name line ${lineNo}: node ID $node is the same ID as $($foldNode[$node].Text) on line $($foldNode[$node].Line) in a different letter case; s3-gateway-dbup lets it through but the node would be registered twice.") }
+            } else {
+                $seenNode[$node] = $lineNo
+                $foldNode[$node] = [pscustomobject]@{ Text = $node; Line = $lineNo }
+            }
+        }
+        if ($pole) {
+            if ($seenPole.ContainsKey($pole)) {
+                $found++
+                if ($found -le $limit) { $out.Add("$Name line ${lineNo}: pole ID $pole is already used on line $($seenPole[$pole]) (s3-gateway-dbup stops on a duplicate pole ID).") }
+            } else {
+                $seenPole[$pole] = $lineNo
+            }
+        }
+    }
+    if ($found -gt $limit) { $out.Add("${Name}: ... and $($found - $limit) more duplicate(s) not listed.") }
+    return $out.ToArray()
+}
+
 function Get-SitePlan {
     param([string]$Dir)
     $plan = [pscustomobject]@{ Dir = $Dir; Exists = $false; Items = @(); CsvName = 'samplelist.csv'; Errors = @(); Found = @(); Missing = @(); Usable = $false }
@@ -753,6 +823,10 @@ function Get-SitePlan {
     $hasConf = Test-Path -LiteralPath (Join-Path $Dir 'pygw_conf.py') -PathType Leaf
     if ((-not $csv.Error) -and $hasConf -and ($csv.Name -cne 'samplelist.csv') -and -not (Test-Path -LiteralPath (Join-Path $Dir $csv.Name) -PathType Leaf)) {
         $errs += "pygw_conf.py names the node list '$($csv.Name)' but that file is not in $Dir (the image only ships samplelist.csv, so first boot would stop at s3-gateway-dbup)."
+    }
+    # Duplicate nodes in the node list stop s3-gateway-dbup the same way (checked here, before the card is written).
+    if ((-not $csv.Error) -and (Test-Path -LiteralPath (Join-Path $Dir $csv.Name) -PathType Leaf)) {
+        $errs += @(Get-NodeListProblems -Path (Join-Path $Dir $csv.Name) -Name $csv.Name)
     }
     $plan.Errors = $errs
     $items = @()

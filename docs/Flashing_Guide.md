@@ -519,6 +519,7 @@ The Gateway ID becomes the gateway's **hostname**, so:
 | **"Gateway ID ... not valid"** | See section 8. |
 | **"ID was already flashed"** | Each gateway needs a unique ID. Only answer yes if you are deliberately re-making that same card. |
 | **Site folder rejected** | It has none of the node-list `.csv` named in `pygw_conf.py`, `pygw_conf.py`, `required-*gw.zip`, or the name is misspelled. |
+| **"node ID ... is already used on line ..."** / **"pole ID ... is already used"** | The site's node-list `.csv` lists the same node (or pole) twice. The line numbers are the same as in Excel (the header is line 1). Nothing was written to the card. Send the message to the project team to get a corrected list. Do not delete lines yourself. |
 | **"cannot be used" / flasher refuses the card** | The site's `pygw_conf.py` has a bad `localDBpath` (not a plain quoted `'name.csv'`, or the name has folders, spaces or capital `.CSV`), or it names a node list that is not in the site folder. Nothing was written to the card. Get corrected site files from the project team. |
 | **Windows: "You need to format the disk"** after flashing | Click **Cancel**. That is normal for a Raspberry Pi card. |
 | **Card marked INCOMPLETE** | It failed or was cancelled. Flash it again. Do not use it as it is. |
