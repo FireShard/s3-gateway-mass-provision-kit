@@ -3,3 +3,4 @@ flash-log.csv
 *.zip
 *.csv
 *.py
+gateway-golden.yaml
