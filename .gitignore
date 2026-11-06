@@ -4,3 +4,7 @@ flash-log.csv
 *.csv
 *.py
 gateway-golden.yaml
+
+# Secrets: a real .env inside the copied app source
+.env
+!.env.example

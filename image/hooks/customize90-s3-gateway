@@ -85,6 +85,16 @@ set_kv() {
     fi
 }
 
+# warn_missing_env_keys ENV EXAMPLE   a real .env is the build input, so a key that .env.example has but .env lacks
+# would silently fall back to the app's built-in default. Print the key NAMES (never values) so it is noticed.
+warn_missing_env_keys() {
+    local env_file="$1" example="$2" missing
+    [ -f "$example" ] || return 0
+    missing="$(comm -13 <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$env_file" | sort -u) \
+                        <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$example" | sort -u) | tr -d '=' | tr '\n' ' ')"
+    [ -z "$missing" ] || echo "WARNING: $env_file lacks keys that $(basename "$example") has: $missing" >&2
+}
+
 # --- pre-flight: fail here, in seconds, not after the apt/pip steps --------------
 if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
     echo "ERROR: $SRC does not look like the s3-zigbee-gateway source tree." >&2
@@ -92,6 +102,16 @@ if [ ! -f "$SRC/requirements.txt" ] || [ ! -d "$SRC/PYSerialGateway" ]; then
     echo "See image/s3-zigbee-gateway/PUT_YOUR_REPO_HERE.txt" >&2
     exit 1
 fi
+
+# The image's .env is built from the source tree's real .env, NOT from .env.example: .env.example is tracked
+# by git and must never hold secrets. .env is git-ignored, so a fresh clone does not have it.
+if [ ! -f "$SRC/.env" ]; then
+    echo "ERROR: $SRC/.env is missing." >&2
+    echo "The image's .env is built from it (not from .env.example, which is tracked by git)." >&2
+    echo "Create it:  cp $SRC/.env.example $SRC/.env   then fill in the deployment values." >&2
+    exit 1
+fi
+warn_missing_env_keys "$SRC/.env" "$SRC/.env.example"
 
 # The bundled dbup MUST honor S3_DBUP_SKIP_RESTART.
 # s3-gateway-firstboot.service is ordered Before= the gateway service. If dbup
@@ -230,8 +250,8 @@ python3 -m venv '$TARGET_DIR/.venv'
 '$TARGET_DIR/.venv/bin/pip' install -r '$TARGET_DIR/requirements.txt'
 "
 
-echo "==> Writing baseline .env (GATEWAY_ID left UNPROVISIONED on purpose)"
-cp "$ROOTFS$TARGET_DIR/.env.example" "$APP_ENV"
+echo "==> Writing baseline .env from $SRC/.env (GATEWAY_ID left UNPROVISIONED on purpose)"
+cp "$SRC/.env" "$APP_ENV"
 set_kv "$APP_ENV" DB_USER "$SERVICE_USER"
 set_kv "$APP_ENV" GATEWAY_ID UNPROVISIONED
 set_kv "$APP_ENV" MQTT_LOG_FILE "$OPERATOR_DIR/log/mqtt.log"
