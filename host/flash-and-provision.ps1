@@ -55,6 +55,14 @@
     Combined S3 + S5 image only. USB serial number of this unit's OpenThread RCP (the ESP32-C6).
     Optional and independent of -ZigbeeSerial. Generic serials (such as 0001) are refused.
     Find one with: udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+.PARAMETER TailscaleAuthKeyFile
+    Image built with Tailscale only (the combined S3 + S5 image). A text file holding a Tailscale auth key
+    (one line, tskey-auth-...). The key is written to provision.env, and the gateway joins your tailnet by
+    itself at first boot and then removes it from the card. The script looks inside the image (or, with
+    -NoFlash, the card) first and refuses a key for one that has no Tailscale. With -Batch the same key goes
+    on every card, so it must be a reusable key. The key sits in plain text on the card's boot partition
+    until the gateway has joined: use a pre-approved key that expires soon. The wizard asks for a key by
+    itself when the image has Tailscale; the key is typed hidden and never written to the log.
 .PARAMETER SiteDir
     Folder holding this gateway's site files, used exactly as given.
 .PARAMETER Site
@@ -106,6 +114,10 @@
     Many cards: one CSV row per card, site files from .\site-files\<site>
 
 .EXAMPLE
+    .\flash-and-provision.ps1 -Image D:\images\combined.img -DiskNumber 2 -GatewayId s3-gw-03 -TailscaleAuthKeyFile .\tailscale.key
+    One card of the combined image that joins the tailnet at first boot.
+
+.EXAMPLE
     .\flash-and-provision.ps1 -NoFlash -DiskNumber 2 -GatewayId s3-gw-07
     Re-provision an already flashed card without re-flashing it.
 #>
@@ -117,6 +129,7 @@ param(
     [string]$GatewayId,
     [string]$ZigbeeSerial,
     [string]$RcpSerial,
+    [string]$TailscaleAuthKeyFile,
     [string]$SiteDir,
     [string]$Site,
     [string]$SiteFilesRoot,
@@ -137,6 +150,12 @@ $script:FlushEveryBytes  = 64MB
 $script:GatewayIdPattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\z'
 # Same rule radio-bind applies to the USB serial numbers it keys radios on.
 $script:RadioSerialPattern = '^[A-Za-z0-9_.:-]{1,64}\z'
+# Same rule host/lib/site-files.sh applies: tskey-auth- then letters, digits, '-' and '_'.
+$script:TailscaleAuthKeyPattern = '^tskey-auth-[A-Za-z0-9_-]{8,200}\z'
+$script:TailscaleKey     = ''    # the key to write in command-line mode (from -TailscaleAuthKeyFile or a prompt)
+$script:Prompted         = $false
+$script:ImageTsState     = ''    # does the chosen image have Tailscale and its first-boot join? yes / no / unknown
+$script:ImageTsPath      = ''
 $script:CardBuses        = @('USB', 'SD', 'MMC')
 $script:GuardPaths       = @()
 $script:DiskFromParam    = $false
@@ -226,12 +245,265 @@ function Get-RadioSerialProblems {
 }
 
 function Get-ProvisionEnvText {
-    # The exact content of provision.env: LF line endings, ASCII. Radio serials only when given.
-    param([string]$Gw, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
+    # The exact content of provision.env: LF line endings, ASCII. Radio serials and the Tailscale key only when given.
+    param([string]$Gw, [string]$ZigbeeSerial = '', [string]$RcpSerial = '', [string]$TailscaleAuthKey = '')
     $text = "GATEWAY_ID=$Gw`n"
-    if ($ZigbeeSerial) { $text += "ZIGBEE_SERIAL=$ZigbeeSerial`n" }
-    if ($RcpSerial)    { $text += "RCP_SERIAL=$RcpSerial`n" }
+    if ($ZigbeeSerial)     { $text += "ZIGBEE_SERIAL=$ZigbeeSerial`n" }
+    if ($RcpSerial)        { $text += "RCP_SERIAL=$RcpSerial`n" }
+    if ($TailscaleAuthKey) { $text += "TAILSCALE_AUTHKEY=$TailscaleAuthKey`n" }
     return $text
+}
+
+# ---------------------------------------------------------------------------
+# Tailscale auth key (images built with the gateway-tailscale first-boot join)
+# A card whose provision.env has a TAILSCALE_AUTHKEY= line joins the gateway tailnet at first boot:
+# /usr/local/sbin/gateway-tailscale-join reads the key, joins, then removes the line from the card.
+# A key is only offered for an image that really has Tailscale AND that join service inside it, found by
+# looking into the image's root filesystem (read-only; nothing is mounted).
+# ---------------------------------------------------------------------------
+function Get-TailscaleAuthKeyProblem {
+    # Why this key cannot be used (one line), or '' when it is fine. Same wording as host/lib/site-files.sh.
+    param([string]$Key)
+    if (-not $Key) { return 'the key is empty' }
+    if ($Key.StartsWith('tskey-api-')) { return 'that is a Tailscale API access token, not an auth key (create one under Settings > Keys > Generate auth key)' }
+    if ($Key.StartsWith('tskey-client-')) { return 'that is an OAuth client secret, not an auth key (create one under Settings > Keys > Generate auth key)' }
+    if (-not $Key.StartsWith('tskey-auth-')) { return 'an auth key starts with tskey-auth- (create one under Settings > Keys > Generate auth key)' }
+    if ($Key.Length -lt 19) { return 'the key is too short to be a Tailscale auth key' }
+    if ($Key -cnotmatch $script:TailscaleAuthKeyPattern) { return "the key has characters an auth key never contains (only letters, digits, '-' and '_' are allowed; no spaces, quotes or '?' options)" }
+    return ''
+}
+
+function Get-MaskedTailscaleKey {
+    # What is safe to print: the prefix and the last four characters.
+    param([string]$Key)
+    if ($Key.Length -gt 16) { return ('tskey-auth-...' + $Key.Substring($Key.Length - 4)) }
+    return '(hidden)'
+}
+
+function Read-SecretLine {
+    # Like Read-Line, but what is typed is not shown.
+    param([string]$Prompt)
+    $s = Read-Host $Prompt -AsSecureString
+    if ($null -eq $s) { return '' }
+    return (New-Object System.Net.NetworkCredential('', $s)).Password.Trim()
+}
+
+function Read-RawBytes {
+    # Reads Count bytes at Offset. Raw disks (\\.\PhysicalDriveN) only accept reads that start and end on a sector
+    # boundary, so the request is widened to whole 512-byte sectors and trimmed again.
+    param([IO.Stream]$Stream, [long]$Offset, [int]$Count)
+    $sector = 512
+    $start = [long]([Math]::Floor($Offset / $sector) * $sector)
+    $len = [int]([Math]::Ceiling(($Offset + $Count - $start) / $sector) * $sector)
+    $buf = New-Object byte[] $len
+    [void]$Stream.Seek($start, [IO.SeekOrigin]::Begin)
+    $got = 0
+    while ($got -lt $len) {
+        $n = $Stream.Read($buf, $got, $len - $got)
+        if ($n -le 0) { break }
+        $got += $n
+    }
+    if ($got -lt ($Offset - $start + $Count)) { throw 'short read' }
+    $out = New-Object byte[] $Count
+    [Array]::Copy($buf, [int]($Offset - $start), $out, 0, $Count)
+    return ,$out
+}
+
+function Get-Ext4Context {
+    # Reads the superblock of the ext2/3/4 filesystem that starts at PartOffset; $null if there is none.
+    param([IO.Stream]$Stream, [long]$PartOffset)
+    $sb = Read-RawBytes -Stream $Stream -Offset ($PartOffset + 1024) -Count 1024
+    if ([BitConverter]::ToUInt16($sb, 0x38) -ne 0xEF53) { return $null }
+    $is64 = (([long][BitConverter]::ToUInt32($sb, 0x60) -band 0x80) -ne 0)
+    $descSize = 32
+    if ($is64) { $descSize = [Math]::Max(64, [int][BitConverter]::ToUInt16($sb, 0xFE)) }
+    return [pscustomobject]@{
+        Stream         = $Stream
+        Base           = $PartOffset
+        BlockSize      = [int](1024 -shl [int][BitConverter]::ToUInt32($sb, 0x18))
+        FirstDataBlock = [long][BitConverter]::ToUInt32($sb, 0x14)
+        InodesPerGroup = [long][BitConverter]::ToUInt32($sb, 0x28)
+        InodeSize      = [int][BitConverter]::ToUInt16($sb, 0x58)
+        Is64           = $is64
+        DescSize       = $descSize
+    }
+}
+
+function Read-Ext4Inode {
+    param($Ctx, [long]$Number)
+    $group = [long][Math]::Floor(($Number - 1) / $Ctx.InodesPerGroup)
+    $index = ($Number - 1) % $Ctx.InodesPerGroup
+    $gdt = ($Ctx.FirstDataBlock + 1) * $Ctx.BlockSize
+    $gd = Read-RawBytes -Stream $Ctx.Stream -Offset ($Ctx.Base + $gdt + $group * $Ctx.DescSize) -Count $Ctx.DescSize
+    $table = [long][BitConverter]::ToUInt32($gd, 8)
+    if ($Ctx.Is64) { $table += ([long][BitConverter]::ToUInt32($gd, 0x28)) -shl 32 }
+    return ,(Read-RawBytes -Stream $Ctx.Stream -Offset ($Ctx.Base + $table * $Ctx.BlockSize + $index * $Ctx.InodeSize) -Count 128)
+}
+
+function Add-Ext4ExtentRuns {
+    # Appends (Logical, Count, Physical) for every extent under the extent-tree node at Offset of Bytes.
+    param($Ctx, [byte[]]$Bytes, [int]$Offset, $Runs)
+    if ([BitConverter]::ToUInt16($Bytes, $Offset) -ne 0xF30A) { throw 'bad extent header' }
+    $entries = [int][BitConverter]::ToUInt16($Bytes, $Offset + 2)
+    $depth = [int][BitConverter]::ToUInt16($Bytes, $Offset + 6)
+    for ($e = 0; $e -lt $entries; $e++) {
+        $p = $Offset + 12 + 12 * $e
+        if ($depth -eq 0) {
+            $count = [int][BitConverter]::ToUInt16($Bytes, $p + 4)
+            if ($count -gt 32768) { $count -= 32768 }           # an extent that is allocated but not yet written
+            $phys = ([long][BitConverter]::ToUInt16($Bytes, $p + 6) -shl 32) + [long][BitConverter]::ToUInt32($Bytes, $p + 8)
+            [void]$Runs.Add([pscustomobject]@{ Logical = [long][BitConverter]::ToUInt32($Bytes, $p); Count = $count; Physical = $phys })
+        } else {
+            $leaf = ([long][BitConverter]::ToUInt16($Bytes, $p + 8) -shl 32) + [long][BitConverter]::ToUInt32($Bytes, $p + 4)
+            $child = Read-RawBytes -Stream $Ctx.Stream -Offset ($Ctx.Base + $leaf * $Ctx.BlockSize) -Count $Ctx.BlockSize
+            Add-Ext4ExtentRuns -Ctx $Ctx -Bytes $child -Offset 0 -Runs $Runs
+        }
+    }
+}
+
+function Find-Ext4DirEntry {
+    # Inode number of Name inside the directory Inode, 0 if it is not there. Throws on layouts it cannot read.
+    param($Ctx, [byte[]]$Inode, [string]$Name)
+    $flags = [long][BitConverter]::ToUInt32($Inode, 0x20)
+    if (($flags -band 0x10000000) -ne 0) { throw 'inline directory' }
+    $runs = New-Object System.Collections.ArrayList
+    if (($flags -band 0x80000) -ne 0) {
+        Add-Ext4ExtentRuns -Ctx $Ctx -Bytes $Inode -Offset 0x28 -Runs $runs
+    } else {
+        for ($b = 0; $b -lt 12; $b++) {                       # old block-mapped directories: direct blocks only
+            $blk = [long][BitConverter]::ToUInt32($Inode, 0x28 + 4 * $b)
+            if ($blk -ne 0) { [void]$runs.Add([pscustomobject]@{ Logical = $b; Count = 1; Physical = $blk }) }
+        }
+    }
+    foreach ($run in $runs) {
+        for ($i = 0; $i -lt $run.Count; $i++) {
+            $data = Read-RawBytes -Stream $Ctx.Stream -Offset ($Ctx.Base + ($run.Physical + $i) * $Ctx.BlockSize) -Count $Ctx.BlockSize
+            $off = 0
+            while ($off + 8 -le $Ctx.BlockSize) {
+                $ino = [long][BitConverter]::ToUInt32($data, $off)
+                $recLen = [int][BitConverter]::ToUInt16($data, $off + 4)
+                $nameLen = [int]$data[$off + 6]
+                if (($recLen -lt 8) -or ($off + $recLen -gt $Ctx.BlockSize)) { break }
+                if (($ino -ne 0) -and ($nameLen -eq $Name.Length) -and ([Text.Encoding]::UTF8.GetString($data, $off + 8, $nameLen) -ceq $Name)) { return $ino }
+                $off += $recLen
+            }
+        }
+    }
+    return 0
+}
+
+function Test-Ext4Path {
+    # $true if the absolute Path exists, $false if it does not, $null if it cannot be told (a symlink on the way,
+    # a layout this reader does not know, a read error).
+    param($Ctx, [string]$Path)
+    try {
+        $ino = [long]2
+        $parts = @($Path -split '/' | Where-Object { $_ })
+        for ($k = 0; $k -lt $parts.Count; $k++) {
+            $inode = Read-Ext4Inode -Ctx $Ctx -Number $ino
+            $mode = [int][BitConverter]::ToUInt16($inode, 0) -band 0xF000
+            if ($mode -eq 0xA000) { return $null }
+            if ($mode -ne 0x4000) { return $false }
+            $next = Find-Ext4DirEntry -Ctx $Ctx -Inode $inode -Name $parts[$k]
+            if ($next -eq 0) { return $false }
+            $ino = $next
+        }
+        return $true
+    } catch { return $null }
+}
+
+function Get-StreamTailscaleState {
+    # yes / no / unknown for a disk image or raw disk that starts with an MBR. The root filesystem is the
+    # partition that has /etc/os-release; Tailscale counts only with both tailscaled and the join service.
+    param([IO.Stream]$Stream)
+    try {
+        $mbr = Read-RawBytes -Stream $Stream -Offset 0 -Count 512
+        if (($mbr[510] -ne 0x55) -or ($mbr[511] -ne 0xAA)) { return 'unknown' }
+        for ($n = 0; $n -lt 4; $n++) {
+            $e = 446 + 16 * $n
+            $lba = [long][BitConverter]::ToUInt32($mbr, $e + 8)
+            if (($mbr[$e + 4] -eq 0) -or ($lba -eq 0)) { continue }
+            $ctx = Get-Ext4Context -Stream $Stream -PartOffset ($lba * 512)
+            if ($null -eq $ctx) { continue }
+            if ((Test-Ext4Path -Ctx $ctx -Path '/etc/os-release') -ne $true) { continue }
+            foreach ($p in '/usr/sbin/tailscaled', '/usr/local/sbin/gateway-tailscale-join') {
+                $r = Test-Ext4Path -Ctx $ctx -Path $p
+                if ($null -eq $r) { return 'unknown' }
+                if (-not $r) { return 'no' }
+            }
+            return 'yes'
+        }
+    } catch { }
+    return 'unknown'
+}
+
+function Get-ImageTailscaleState {
+    param([string]$Path)
+    $fs = $null
+    try {
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        return (Get-StreamTailscaleState -Stream $fs)
+    } catch { return 'unknown' }
+    finally { if ($fs) { $fs.Dispose() } }
+}
+
+function Get-DiskTailscaleState {
+    # The same for a card that is already flashed (read-only access to the raw disk; needs Administrator).
+    param([int]$DiskNumber)
+    $fs = $null
+    try {
+        $fs = [IO.File]::Open("\\.\PhysicalDrive$DiskNumber", 'Open', 'Read', 'ReadWrite')
+        return (Get-StreamTailscaleState -Stream $fs)
+    } catch { return 'unknown' }
+    finally { if ($fs) { $fs.Dispose() } }
+}
+
+function Initialize-TailscaleKey {
+    # Command-line mode: loads -TailscaleAuthKeyFile into $script:TailscaleKey and checks it before anything is written.
+    if (-not $script:TailscaleAuthKeyFile) { return }
+    $path = Resolve-UserPath $script:TailscaleAuthKeyFile
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "cannot read the Tailscale key file: $path" }
+    $key = ''
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        $l = (([string]$line) -replace '^\uFEFF', '').Trim().Trim('"', "'").Trim()
+        if ($l -and (-not $l.StartsWith('#'))) { $key = $l; break }
+    }
+    if (-not $key) { throw "the Tailscale key file is empty: $path" }
+    $problem = Get-TailscaleAuthKeyProblem -Key $key
+    if ($problem) { throw "Tailscale auth key: $problem. Nothing was written." }
+    $script:TailscaleKey = $key
+}
+
+function Assert-TailscaleTarget {
+    # A key is only useful when the card will have Tailscale and its first-boot join service: look inside the
+    # image (or, with -NoFlash, the card). Stops before anything is written if it does not.
+    param($Disk)
+    if ($script:NoFlash) {
+        $what = "the card (Disk $($Disk.Number))"
+        $state = Get-DiskTailscaleState -DiskNumber ([int]$Disk.Number)
+    } else {
+        if ($script:ImageTsPath -ne $script:Image) {
+            $script:ImageTsState = Get-ImageTailscaleState -Path $script:Image
+            $script:ImageTsPath = $script:Image
+        }
+        $what = "the image $(Split-Path -Leaf $script:Image)"
+        $state = $script:ImageTsState
+    }
+    if ($state -eq 'no') {
+        throw "A Tailscale auth key was given, but $what has no Tailscale (or no first-boot join service), so the key would sit unused on the card. Nothing was written. Use an image built with Tailscale, or leave the key out."
+    }
+    if ($state -ne 'yes') { Write-Warn "could not look inside $what to check that it has Tailscale; writing the key anyway." }
+}
+
+function Read-TailscaleKeyLoop {
+    # A usable key typed hidden, or '' if the operator gives up (Enter).
+    while ($true) {
+        $k = Read-SecretLine 'Paste the Tailscale auth key (tskey-auth-..., not shown as you type; Enter = no key)'
+        if (-not $k) { return '' }
+        $problem = Get-TailscaleAuthKeyProblem -Key $k
+        if (-not $problem) { return $k }
+        Write-Host "ERROR: $problem." -ForegroundColor Red
+    }
 }
 
 function Test-SiteName {
@@ -906,7 +1178,7 @@ function Assert-FileBytes {
 
 function Write-ProvisionFiles {
     # Returns how many site files were copied.
-    param([string]$BootRoot, [string]$Gw, $Plan, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
+    param([string]$BootRoot, [string]$Gw, $Plan, [string]$ZigbeeSerial = '', [string]$RcpSerial = '', [string]$TailscaleAuthKey = '')
     $pdir = Join-Path $BootRoot $script:ProvisionDirName
     New-Item -ItemType Directory -Path $pdir -Force | Out-Null
 
@@ -940,13 +1212,14 @@ function Write-ProvisionFiles {
     # provision.env (first boot refuses it loudly) instead of a half-provisioned one.
     # First boot SOURCES this file as root in bash, so it must be plain ASCII,
     # LF line endings and no BOM - never let PowerShell pick the encoding.
-    $envBytes = [Text.Encoding]::ASCII.GetBytes((Get-ProvisionEnvText -Gw $Gw -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial))
+    $envBytes = [Text.Encoding]::ASCII.GetBytes((Get-ProvisionEnvText -Gw $Gw -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial -TailscaleAuthKey $TailscaleAuthKey))
     $envPath = Join-Path $pdir 'provision.env'
     [IO.File]::WriteAllBytes($envPath, $envBytes)
     Assert-FileBytes -Path $envPath -Expected $envBytes
     $shown = "GATEWAY_ID=$Gw"
     if ($ZigbeeSerial) { $shown += ", ZIGBEE_SERIAL=$ZigbeeSerial" }
     if ($RcpSerial)    { $shown += ", RCP_SERIAL=$RcpSerial" }
+    if ($TailscaleAuthKey) { $shown += ", TAILSCALE_AUTHKEY=$(Get-MaskedTailscaleKey -Key $TailscaleAuthKey)" }
     Write-Step "Wrote provision.env ($shown) to $BootRoot"
     return $copied
 }
@@ -955,10 +1228,14 @@ function Write-ProvisionFiles {
 # One card
 # ---------------------------------------------------------------------------
 function Invoke-Card {
-    param([string]$Gw, [string]$SiteDirPath, [string]$ZigbeeSerial = '', [string]$RcpSerial = '')
+    param([string]$Gw, [string]$SiteDirPath, [string]$ZigbeeSerial = '', [string]$RcpSerial = '', [string]$TailscaleAuthKey = '')
     $serialProblems = @(Get-RadioSerialProblems -Zigbee $ZigbeeSerial -Rcp $RcpSerial)
     if ($serialProblems.Count -gt 0) {
         throw ("The radio serials for $Gw cannot be used:`n  - " + ($serialProblems -join "`n  - ") + "`nNothing was written to the card.")
+    }
+    if ($TailscaleAuthKey) {
+        $tsProblem = Get-TailscaleAuthKeyProblem -Key $TailscaleAuthKey
+        if ($tsProblem) { throw "The Tailscale auth key for $Gw cannot be used: $tsProblem.`nNothing was written to the card." }
     }
     $plan = Get-SitePlan -Dir $SiteDirPath
     # A site folder that was named but is missing or empty is an error, not something to skip quietly:
@@ -980,6 +1257,7 @@ function Invoke-Card {
         throw ("The site files in $($plan.Dir) cannot be used:`n  - " + (@($plan.Errors) -join "`n  - ") + "`nNothing was written to the card. Fix the site files and try again.")
     }
     $disk = Get-TargetDisk
+    if ($TailscaleAuthKey) { Assert-TailscaleTarget -Disk $disk }
     $fingerprint = Confirm-Disk -Disk $disk
 
     if (-not $script:NoFlash) { [void](Invoke-Flash -Disk $disk -Fingerprint $fingerprint) }
@@ -989,7 +1267,7 @@ function Invoke-Card {
     $copied = 0
     $unmounted = $false
     try {
-        $copied = @(Write-ProvisionFiles -BootRoot $vol.Root -Gw $Gw -Plan $plan -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial)[-1]
+        $copied = @(Write-ProvisionFiles -BootRoot $vol.Root -Gw $Gw -Plan $plan -ZigbeeSerial $ZigbeeSerial -RcpSerial $RcpSerial -TailscaleAuthKey $TailscaleAuthKey)[-1]
     } finally {
         $unmounted = Dismount-BootVolume -Volume $vol -DiskNumber $disk.Number
     }
@@ -1112,10 +1390,31 @@ function Test-BatchSites {
 # ---------------------------------------------------------------------------
 # Guided mode
 # ---------------------------------------------------------------------------
+function Request-TailscaleKey {
+    # Prompted command-line run: when the image has Tailscale, asks whether the card(s) should get an auth key.
+    param([bool]$ForBatch)
+    $script:ImageTsPath = $script:Image
+    $script:ImageTsState = Get-ImageTailscaleState -Path $script:Image
+    if ($script:ImageTsState -ne 'yes') { return }
+    Write-Host ''
+    Write-Host 'Tailscale is installed in this image. A card that carries a Tailscale auth key joins your tailnet'
+    Write-Host 'by itself at first boot; without one the gateway stays off the tailnet.'
+    if ($ForBatch) {
+        Write-Host 'One key goes on every card of the batch, so it must be a REUSABLE key (a one-time key lets only the first gateway join).'
+        $q = 'Add a Tailscale auth key to every card in this batch? (y/N)'
+    } else {
+        $q = 'Add a Tailscale auth key to this card? (y/N)'
+    }
+    if ((Read-Line $q) -notmatch '^[yY]') { return }
+    Write-Host "The key is stored as plain text on the card's boot partition until the gateway has joined; the gateway then removes it."
+    $script:TailscaleKey = Read-TailscaleKeyLoop
+}
+
 function Read-MissingAnswers {
     $needImage = (-not $script:NoFlash) -and (-not $script:Image)
     $needWho   = (-not $script:Batch) -and (-not $script:GatewayId)
     if (-not ($needImage -or $needWho)) { return }
+    $script:Prompted = $true
     Write-Host ''
     Write-Host 'S3 Gateway - flash and provision an SD card' -ForegroundColor Cyan
     Write-Host '(press Ctrl+C at any time to stop)'
@@ -1159,6 +1458,9 @@ $script:WzSite        = ''
 $script:WzSiteDir     = ''
 $script:WzZigbeeSerial = ''                    # radio serials of the card in hand: set per row in batch mode,
 $script:WzRcpSerial   = ''                    # empty (nothing written) for a single card
+$script:WzTailscaleKey = ''                    # Tailscale auth key of the card in hand (empty = none); kept in memory only
+$script:WzTsState     = ''                    # does the card in hand get Tailscale (from the image, or the card itself on a relabel)?
+$script:LastTsKey     = ''                    # the key typed for the previous card, offered again for the next one
 $script:GwId          = ''
 $script:Card          = $null
 $script:Cards         = @()
@@ -1412,6 +1714,15 @@ function Test-ImageFile {
     $script:Image = $Path
     $script:ImageBytes = $size
     $script:ImageOk = $true
+    $script:ImageTsPath = $Path
+    $script:ImageTsState = Get-ImageTailscaleState -Path $Path
+    if ($script:ImageTsState -eq 'yes') {
+        Write-Ok 'Tailscale is installed in this image: you will be asked about a Tailscale auth key for each card.'
+    } elseif ($script:ImageTsState -eq 'no') {
+        Write-Say '(Tailscale is not installed in this image, so no Tailscale key is asked for.)'
+    } else {
+        Write-Say '(Could not look inside the image to check for Tailscale. No Tailscale key is asked for.)'
+    }
     return $true
 }
 
@@ -1691,6 +2002,27 @@ function Select-Site {
 }
 
 # --- running one card --------------------------------------------------------
+function Read-WizardTailscaleKey {
+    # Sets $script:WzTsState and $script:WzTailscaleKey for the card in hand.
+    param([string]$Mode)
+    $script:WzTailscaleKey = ''
+    if ($Mode -eq 'relabel') { $script:WzTsState = Get-DiskTailscaleState -DiskNumber ([int]$script:Card.Number) }
+    else { $script:WzTsState = $script:ImageTsState }
+    if ($script:WzTsState -ne 'yes') { return }
+    Write-Head 'Tailscale'
+    Write-Say 'Tailscale is installed in this image. A card that carries a Tailscale auth key joins your'
+    Write-Say 'tailnet by itself at first boot; without one the gateway stays off the tailnet.'
+    if (-not (Read-YesNo 'Add a Tailscale auth key to this card?' $false)) { return }
+    if ($script:LastTsKey -and (Read-YesNo 'Use the same key as the last card? (works only for a reusable key)' $false)) {
+        $script:WzTailscaleKey = $script:LastTsKey
+        return
+    }
+    Write-Say "The key is stored as plain text on the card's boot partition until the gateway has joined;"
+    Write-Say 'the gateway then removes it. Use a pre-approved key that expires soon.'
+    $script:WzTailscaleKey = Read-TailscaleKeyLoop
+    if ($script:WzTailscaleKey) { $script:LastTsKey = $script:WzTailscaleKey }
+}
+
 function Show-Plan {
     param([string]$Mode, [string]$Id)
     $c = $script:Card
@@ -1707,6 +2039,13 @@ function Show-Plan {
         $zbText = '<probe>'; if ($script:WzZigbeeSerial) { $zbText = $script:WzZigbeeSerial }
         $rcpText = '<probe>'; if ($script:WzRcpSerial) { $rcpText = $script:WzRcpSerial }
         Write-Say ('   {0,-12} zigbee {1}, rcp {2}' -f 'Radios', $zbText, $rcpText)
+    }
+    if ($script:WzTsState -eq 'yes') {
+        if ($script:WzTailscaleKey) {
+            Write-Say ('   {0,-12} auth key {1} (joins the tailnet at first boot)' -f 'Tailscale', (Get-MaskedTailscaleKey -Key $script:WzTailscaleKey))
+        } else {
+            Write-Say ('   {0,-12} no key - this card will not join a tailnet by itself' -f 'Tailscale')
+        }
     }
     $what = 'none - the defaults built into the image'
     if ($script:WzSiteDir) {
@@ -1730,7 +2069,7 @@ function Invoke-WizardCard {
     $script:Flashing = $true
     $ok = $false
     try {
-        [void](Invoke-Card -Gw $Id -SiteDirPath $script:WzSiteDir -ZigbeeSerial $script:WzZigbeeSerial -RcpSerial $script:WzRcpSerial)
+        [void](Invoke-Card -Gw $Id -SiteDirPath $script:WzSiteDir -ZigbeeSerial $script:WzZigbeeSerial -RcpSerial $script:WzRcpSerial -TailscaleAuthKey $script:WzTailscaleKey)
         $ok = $true
     } catch [System.Management.Automation.PipelineStoppedException] {
         throw
@@ -1774,6 +2113,7 @@ function Invoke-SingleMode {
         Read-GatewayId
         if (-not (Select-Site)) { return }
         if (-not (Select-Card -Mode 'flash')) { return }
+        Read-WizardTailscaleKey -Mode 'flash'
         Show-Plan -Mode 'flash' -Id $script:GwId
         if (-not (Read-YesNo 'Is this correct?' $true)) {
             Write-Say "OK - let's start this card again."
@@ -1799,6 +2139,7 @@ function Invoke-RelabelMode {
         Read-GatewayId
         if (-not (Select-Site)) { return }
         if (-not (Select-Card -Mode 'relabel')) { return }
+        Read-WizardTailscaleKey -Mode 'relabel'
         Show-Plan -Mode 'relabel' -Id $script:GwId
         if (-not (Read-YesNo 'Is this correct?' $true)) {
             Wait-ForRemoval -Number $script:Card.Number
@@ -1884,6 +2225,17 @@ function Invoke-BatchMode {
     if ($doneCount -gt 0) {
         if (Read-YesNo "$doneCount card(s) were already flashed. Skip those?" $true) { $skipDone = $true }
     }
+    $batchKey = ''
+    if ($script:ImageTsState -eq 'yes') {
+        Write-Head 'Tailscale'
+        Write-Say 'Tailscale is installed in this image. One auth key can go on every card in this batch.'
+        Write-Say 'It must be a REUSABLE key: a one-time key lets only the first gateway join.'
+        if (Read-YesNo 'Add a Tailscale auth key to every card in this batch?' $false) {
+            Write-Say "The key is stored as plain text on the card's boot partition until the gateway has joined;"
+            Write-Say 'the gateway then removes it. Use a pre-approved key that expires soon.'
+            $batchKey = Read-TailscaleKeyLoop
+        }
+    }
     if (-not (Read-YesNo 'Start the batch?' $true)) { return }
 
     $okN = 0; $failN = 0; $skipN = 0
@@ -1892,6 +2244,8 @@ function Invoke-BatchMode {
         $script:WzSite = $rows[$i].Site
         $script:WzZigbeeSerial = $rows[$i].ZigbeeSerial
         $script:WzRcpSerial = $rows[$i].RcpSerial
+        $script:WzTsState = $script:ImageTsState
+        $script:WzTailscaleKey = $batchKey
         $script:WzSiteDir = ''
         if ($script:WzSite) { $script:WzSiteDir = Join-Path $script:WzSiteRoot $script:WzSite }
         if ($skipDone -and (Get-PriorUse -Id $script:GwId)) { $skipN++; continue }
@@ -1961,7 +2315,7 @@ function Show-MainMenu {
 
 function Test-WizardRequested {
     # Any card-specific option means "command-line mode"; otherwise the wizard runs.
-    if ($script:ListDisks -or $script:NoFlash -or $script:Batch -or $script:GatewayId -or $script:SiteDir -or $script:Site) { return $false }
+    if ($script:ListDisks -or $script:NoFlash -or $script:Batch -or $script:GatewayId -or $script:SiteDir -or $script:Site -or $script:TailscaleAuthKeyFile) { return $false }
     if ($script:DiskNumber -ge 0) { return $false }
     return $true
 }
@@ -2033,6 +2387,7 @@ function Invoke-S3Provision {
 
     $script:DiskFromParam = ($script:DiskNumber -ge 0)
     Read-MissingAnswers
+    Initialize-TailscaleKey
 
     $script:Image         = Resolve-UserPath $script:Image
     $script:Batch         = Resolve-UserPath $script:Batch
@@ -2045,6 +2400,9 @@ function Invoke-S3Provision {
         Assert-ImageUsable
         Initialize-RawDiskType   # fail now, not after the card has been wiped
     }
+
+    if ($script:Prompted -and (-not $script:TailscaleKey) -and (-not $script:NoFlash)) { Request-TailscaleKey -ForBatch $batchMode }
+    if ($script:TailscaleKey -and $batchMode) { Write-Warn 'The same Tailscale auth key goes on every card in this batch, so it must be a reusable key.' }
 
     $script:GuardPaths = @($script:Image, $script:Batch, $script:SiteDir, $script:SiteFilesRoot, $PSScriptRoot) | Where-Object { $_ }
 
@@ -2094,7 +2452,7 @@ function Invoke-S3Provision {
                 Write-Host ('#' * 62)
                 [void](Read-Line 'Press Enter when the card is in')
                 try {
-                    $res = Invoke-Card -Gw $r.GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $r.ZigbeeSerial -RcpSerial $r.RcpSerial
+                    $res = Invoke-Card -Gw $r.GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $r.ZigbeeSerial -RcpSerial $r.RcpSerial -TailscaleAuthKey $script:TailscaleKey
                     $status = 'OK'
                     $files = [string]$res.SiteFiles
                     break
@@ -2134,7 +2492,7 @@ function Invoke-S3Provision {
         Write-Warn '-Site has no effect without -SiteFilesRoot. No site files will be copied.'
     }
 
-    [void](Invoke-Card -Gw $script:GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $script:ZigbeeSerial -RcpSerial $script:RcpSerial)
+    [void](Invoke-Card -Gw $script:GatewayId -SiteDirPath $siteDirPath -ZigbeeSerial $script:ZigbeeSerial -RcpSerial $script:RcpSerial -TailscaleAuthKey $script:TailscaleKey)
     return 0
 }
 

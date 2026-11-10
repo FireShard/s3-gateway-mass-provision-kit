@@ -4,6 +4,7 @@
 #
 #   Gateway IDs     GATEWAY_ID_RE, is_valid_gateway_id
 #   Radio serials   is_valid_radio_serial, is_weak_radio_serial, radio_serial_problems, provision_env_text
+#   Tailscale       tailscale_authkey_problem, mask_tailscale_authkey, tailscale_in_image, tailscale_on_card
 #   Text clean-up   trim, clean_field
 #   Site folders    site_csv_name, site_problem, node_list_problems, site_inspect
 #   Batch CSV       read_gateway_csv  ->  B_ID[] / B_SITE[] / B_ZB[] / B_RCP[]
@@ -66,11 +67,108 @@ radio_serial_problems() {
     fi
 }
 
-# provision_env_text GATEWAY_ID [ZIGBEE] [RCP]  the exact content of provision.env. LF line endings only.
+# provision_env_text GATEWAY_ID [ZIGBEE] [RCP] [TAILSCALE_AUTHKEY]  the exact content of provision.env.
+# LF line endings only.
 provision_env_text() {
     printf 'GATEWAY_ID=%s\n' "$1"
     if [ -n "${2:-}" ]; then printf 'ZIGBEE_SERIAL=%s\n' "$2"; fi
     if [ -n "${3:-}" ]; then printf 'RCP_SERIAL=%s\n' "$3"; fi
+    if [ -n "${4:-}" ]; then printf 'TAILSCALE_AUTHKEY=%s\n' "$4"; fi
+}
+
+# --- Tailscale (images built with the gateway-tailscale first-boot join) ---------------
+# A card whose provision.env has a TAILSCALE_AUTHKEY= line joins the gateway tailnet at first boot:
+# /usr/local/sbin/gateway-tailscale-join (gateway-tailscale repo) reads the key, joins, then removes the
+# line from the card. The flashers only offer a key for an image that really has Tailscale AND that join
+# service inside it, found by looking into the image's root filesystem (read-only, nothing is mounted).
+
+# A Tailscale auth key is tskey-auth- followed by letters, digits, '-' and '_'. Nothing else is accepted:
+# API access tokens (tskey-api-) and OAuth client secrets (tskey-client-) are not auth keys, and a value
+# with spaces, quotes or shell characters has no business in provision.env.
+TAILSCALE_AUTHKEY_RE='^tskey-auth-[A-Za-z0-9_-]{8,200}$'
+
+# tailscale_authkey_problem KEY  prints why KEY cannot be used (one line); prints nothing when it is fine.
+tailscale_authkey_problem() {
+    local k="${1-}"
+    if [ -z "$k" ]; then
+        echo "the key is empty"
+    elif [[ $k == tskey-api-* ]]; then
+        echo "that is a Tailscale API access token, not an auth key (create one under Settings > Keys > Generate auth key)"
+    elif [[ $k == tskey-client-* ]]; then
+        echo "that is an OAuth client secret, not an auth key (create one under Settings > Keys > Generate auth key)"
+    elif [[ $k != tskey-auth-* ]]; then
+        echo "an auth key starts with tskey-auth- (create one under Settings > Keys > Generate auth key)"
+    elif [ "${#k}" -lt 19 ]; then
+        echo "the key is too short to be a Tailscale auth key"
+    elif ! [[ $k =~ $TAILSCALE_AUTHKEY_RE ]]; then
+        echo "the key has characters an auth key never contains (only letters, digits, '-' and '_' are allowed; no spaces, quotes or '?' options)"
+    fi
+}
+
+# mask_tailscale_authkey KEY  what is safe to print: the prefix and the last four characters.
+mask_tailscale_authkey() {
+    local k="${1-}"
+    if [ "${#k}" -gt 16 ]; then printf 'tskey-auth-...%s' "${k: -4}"; else printf '(hidden)'; fi
+}
+
+# mbr_partition_start FILE N  byte offset of MBR partition N (1-4) in FILE (an image or a block device);
+# fails when the slot is empty or FILE has no MBR.
+mbr_partition_start() {
+    local file="$1" n="$2" base type lba
+    base=$((446 + (n - 1) * 16))
+    type="$(od -An -tu1 -j $((base + 4)) -N1 "$file" 2>/dev/null | tr -d ' \n')"
+    lba="$(od -An -tu4 --endian=little -j $((base + 8)) -N4 "$file" 2>/dev/null | tr -d ' \n')"
+    { [ -n "$type" ] && [ "$type" != 0 ] && [ -n "$lba" ] && [ "$lba" -gt 0 ]; } || return 1
+    echo $((lba * 512))
+}
+
+# ext4_has_path TARGET PATH  looks PATH up in the ext2/3/4 filesystem at TARGET without mounting it.
+# TARGET is a partition device, or FILE?offset=BYTES for a partition inside an image file.
+# Returns 0 if PATH exists, 1 if it does not, 2 if TARGET could not be read as such a filesystem (or
+# debugfs from e2fsprogs is missing).
+ext4_has_path() {
+    local out
+    command -v debugfs >/dev/null 2>&1 || return 2
+    out="$(debugfs -R "stat $2" "$1" 2>&1)" || true      # debugfs reports problems in its output, not its exit status
+    if grep -q '^Inode:' <<<"$out"; then return 0; fi
+    if grep -q 'File not found by ext2_lookup' <<<"$out"; then return 1; fi
+    return 2
+}
+
+# tailscale_state_of_fs TARGET  if TARGET is a Linux root filesystem (it has /etc/os-release), prints
+# yes (Tailscale and its first-boot join service are both there) or no, and returns 0. Returns 1 for
+# anything else (the boot partition, a data partition, unreadable).
+tailscale_state_of_fs() {
+    local p rc
+    ext4_has_path "$1" /etc/os-release || return 1
+    for p in /usr/sbin/tailscaled /usr/local/sbin/gateway-tailscale-join; do
+        rc=0; ext4_has_path "$1" "$p" || rc=$?
+        if [ "$rc" -ne 0 ]; then echo no; return 0; fi
+    done
+    echo yes
+}
+
+# tailscale_in_image IMAGE  prints yes, no or unknown (the root filesystem could not be read: no MBR,
+# no debugfs, an unusual layout). IMAGE is a plain .img file.
+tailscale_in_image() {
+    local n off st
+    for n in 1 2 3 4; do
+        off="$(mbr_partition_start "$1" "$n")" || continue
+        if st="$(tailscale_state_of_fs "$1?offset=$off")"; then echo "$st"; return 0; fi
+    done
+    echo unknown
+}
+
+# tailscale_on_card DEVICE  the same for a card that is already flashed (partition devices, read-only).
+tailscale_on_card() {
+    local dev="$1" n p st
+    for n in 2 3 4 1; do
+        for p in "${dev}${n}" "${dev}p${n}"; do
+            [ -b "$p" ] || continue
+            if st="$(tailscale_state_of_fs "$p")"; then echo "$st"; return 0; fi
+        done
+    done
+    echo unknown
 }
 
 # --- text clean-up -------------------------------------------------------------

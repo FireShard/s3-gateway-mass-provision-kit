@@ -357,6 +357,22 @@ Mistakes are caught before anything is written: a serial with unusual characters
 `0001`, which many boards share), the same serial for both radios, or one serial on two cards. Find a radio's
 serial with `udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT`.
 
+### Combined S3 + S5 image: Tailscale auth key
+
+An image built with Tailscale (the `gateway-tailscale` first-boot join) can put a card on your tailnet at first
+boot: the flashers write `TAILSCALE_AUTHKEY=<key>` to the card's `provision.env`, and the gateway removes the line
+once it has joined. The flashers look **inside the image** (read-only, via `debugfs`; nothing is mounted) for
+`/usr/sbin/tailscaled` and `/usr/local/sbin/gateway-tailscale-join`, and only then ask for a key, so images
+without Tailscale are unaffected.
+
+- Wizards (`flash-and-provision-wizard.sh`, `flash-and-provision.ps1`): asked per card, or once for a whole batch (a
+  reusable key). The key is typed hidden and never logged. On Linux the wizard hands it to the flasher in the
+  `TAILSCALE_AUTHKEY` environment variable, never as an argument.
+- Command line: `--tailscale-authkey-file FILE` (`-TailscaleAuthKeyFile`), one line, `tskey-auth-...` only. A key for
+  an image or card without Tailscale is refused before anything is written.
+
+See *Tailscale auth key* in `Flashing_Guide.md` for the operator steps and what kind of key to create.
+
 ---
 
 # Provisioning rules

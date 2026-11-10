@@ -41,6 +41,19 @@
 # Both are optional and independent; leave them out for a plain S3 gateway. Generic serials (such as
 # 0001) and a serial used on two cards are refused before anything is written. Find a radio's serial with
 #   udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+#
+# ── Tailscale: join the tailnet at first boot ─────────────────────────────
+# An image built with Tailscale (the combined S3 + S5 image) carries a first-boot join service. Give a card
+# a Tailscale auth key and it joins your tailnet by itself once it has been provisioned; the gateway then
+# removes the key from the card. Put the key in a file (one line, tskey-auth-...) so it never shows up in
+# the process list or your shell history:
+#   sudo ./flash-and-provision.sh ... --gateway-id s3-gw-03 --tailscale-authkey-file ./tailscale.key
+# The flasher looks inside the image (or, with --no-flash, the card) first and refuses a key for one that
+# has no Tailscale, so a key is never left unused on a card. In batch mode the same key goes on every card:
+# it must be a reusable key (a one-time key joins only the first gateway). The key sits in plain text on the
+# card's boot partition until the gateway has joined, so use a pre-approved key that expires soon.
+# The guided wizard (flash-and-provision-wizard.sh) asks for the key by itself when the image has Tailscale
+# and hands it to this script in the TAILSCALE_AUTHKEY environment variable.
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,6 +70,8 @@ DEVICE=""
 GATEWAY_ID=""
 ZIGBEE_SERIAL=""
 RCP_SERIAL=""
+TS_KEY_FILE=""       # --tailscale-authkey-file
+TS_AUTHKEY=""        # the key to write (from the file, else $TAILSCALE_AUTHKEY); never printed in full
 SITE_DIR=""
 SITE=""
 BATCH_CSV=""
@@ -71,7 +86,7 @@ usage() { print_script_usage "${BASH_SOURCE[0]}"; exit "${1:-0}"; }
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --image|--device|--gateway-id|--zigbee-serial|--rcp-serial|--site-dir|--site|--batch|--site-files-root)
+            --image|--device|--gateway-id|--zigbee-serial|--rcp-serial|--tailscale-authkey-file|--site-dir|--site|--batch|--site-files-root)
                 [ $# -ge 2 ] || die "$1 needs a value."
                 case "$1" in
                     --image)           IMAGE="$2" ;;
@@ -79,6 +94,7 @@ parse_args() {
                     --gateway-id)      GATEWAY_ID="$2" ;;
                     --zigbee-serial)   ZIGBEE_SERIAL="$(clean_field "$2")" ;;
                     --rcp-serial)      RCP_SERIAL="$(clean_field "$2")" ;;
+                    --tailscale-authkey-file) TS_KEY_FILE="$2" ;;
                     --site-dir)        SITE_DIR="$2" ;;
                     --site)            SITE="$2" ;;
                     --batch)           BATCH_CSV="$2" ;;
@@ -129,6 +145,52 @@ validate_args() {
     fi
     if [ -z "$SITE_DIR" ] && { [ -n "$SITE_FILES_ROOT" ] || [ -n "$SITE" ]; }; then
         echo "WARNING: --site-files-root and --site only work together (single-card mode), or --site-files-root with --batch. No site files will be copied." >&2
+    fi
+}
+
+# --- Tailscale auth key --------------------------------------------------------
+# load_tailscale_key  sets TS_AUTHKEY from --tailscale-authkey-file, else from $TAILSCALE_AUTHKEY (how
+# the wizard hands it over: an argument would show up in the process list). Stops before anything is
+# written when the key is not a usable auth key.
+load_tailscale_key() {
+    local line problem=""
+    TS_AUTHKEY=""
+    if [ -n "$TS_KEY_FILE" ]; then
+        [ -r "$TS_KEY_FILE" ] || die "cannot read the Tailscale key file: $TS_KEY_FILE"
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="$(clean_field "${line%$'\r'}")"
+            case "$line" in ""|"#"*) continue ;; esac
+            TS_AUTHKEY="$line"; break
+        done < "$TS_KEY_FILE"
+        [ -n "$TS_AUTHKEY" ] || die "the Tailscale key file is empty: $TS_KEY_FILE"
+    elif [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+        TS_AUTHKEY="$(clean_field "$TAILSCALE_AUTHKEY")"
+    fi
+    unset TAILSCALE_AUTHKEY          # no child process (rpi-imager, dd, mount) needs it
+    [ -n "$TS_AUTHKEY" ] || return 0
+    problem="$(tailscale_authkey_problem "$TS_AUTHKEY")"
+    [ -z "$problem" ] || die "Tailscale auth key: $problem. Nothing was written."
+}
+
+# check_tailscale_target  a key is only useful when the card will have Tailscale and its first-boot join
+# service: look inside the image (or, with --no-flash, the card). Stops before anything is written if not.
+check_tailscale_target() {
+    local state what
+    [ -n "$TS_AUTHKEY" ] || return 0
+    if [ "$DO_FLASH" -eq 1 ]; then
+        what="the image $(basename "$IMAGE")"; state="$(tailscale_in_image "$IMAGE")"
+    elif [ -n "$BATCH_CSV" ]; then
+        return 0                      # a different card each time: nothing to look at up front
+    else
+        what="the card $DEVICE"; state="$(tailscale_on_card "$DEVICE")"
+    fi
+    case "$state" in
+        yes) ;;
+        no)  die "A Tailscale auth key was given, but $what has no Tailscale (or no first-boot join service), so the key would sit unused on the card. Nothing was written. Use an image built with Tailscale, or leave the key out." ;;
+        *)   echo "WARNING: could not look inside $what to check that it has Tailscale (needs 'debugfs' from e2fsprogs); writing the key anyway." >&2 ;;
+    esac
+    if [ -n "$BATCH_CSV" ]; then
+        echo "NOTE: the same Tailscale auth key goes on every card in this batch, so it must be a reusable key." >&2
     fi
 }
 
@@ -251,8 +313,8 @@ copy_site_files() { # site_dir provision_dir
     done
 }
 
-provision_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
-    local gw_id="$1" site_dir="$2" zb="${3:-}" rcp="${4:-}" bootpart pdir shown
+provision_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial] [tailscale_authkey]
+    local gw_id="$1" site_dir="$2" zb="${3:-}" rcp="${4:-}" ts="${5:-}" bootpart pdir shown
     bootpart="$(boot_partition_of "$DEVICE")"
     [ -n "$bootpart" ] || die "could not find the boot partition on $DEVICE"
 
@@ -265,7 +327,7 @@ provision_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
     copy_site_files "$site_dir" "$pdir"
     # Written last: an interrupted run leaves a card with NO provision.env, which
     # first boot refuses loudly, instead of a half-provisioned one.
-    provision_env_text "$gw_id" "$zb" "$rcp" > "$pdir/provision.env"
+    provision_env_text "$gw_id" "$zb" "$rcp" "$ts" > "$pdir/provision.env"
 
     sync
     umount "$MOUNT_POINT"
@@ -274,6 +336,7 @@ provision_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
     shown="GATEWAY_ID=$gw_id"
     if [ -n "$zb" ]; then shown="$shown, ZIGBEE_SERIAL=$zb"; fi
     if [ -n "$rcp" ]; then shown="$shown, RCP_SERIAL=$rcp"; fi
+    if [ -n "$ts" ]; then shown="$shown, TAILSCALE_AUTHKEY=$(mask_tailscale_authkey "$ts")"; fi
     echo "==> Wrote provision.env ($shown) to $bootpart"
 }
 
@@ -281,7 +344,7 @@ do_one_card() { # gateway_id site_dir [zigbee_serial] [rcp_serial]
     local gw_id="$1" site_dir="$2" zb="${3:-}" rcp="${4:-}"
     confirm_device
     if [ "$DO_FLASH" -eq 1 ]; then flash_image; fi
-    provision_card "$gw_id" "$site_dir" "$zb" "$rcp"
+    provision_card "$gw_id" "$site_dir" "$zb" "$rcp" "$TS_AUTHKEY"
     echo "==> Done: $DEVICE -> $gw_id"
 }
 
@@ -328,6 +391,8 @@ run_batch() {
 main() {
     parse_args "$@"
     validate_args
+    load_tailscale_key
+    check_tailscale_target
     trap cleanup EXIT
     if [ -n "$BATCH_CSV" ]; then run_batch; else run_single; fi
 }

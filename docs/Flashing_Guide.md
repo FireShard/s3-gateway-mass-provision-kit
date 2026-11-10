@@ -93,10 +93,11 @@ The wizard asks one question at a time. Press **Enter** to accept a suggested an
    - the disk the image or the kit is stored on,
    - a disk larger than 256 GB,
    - a card too small for the image.
-5. **Summary** - it shows a "Please check" box (image, card, Gateway ID, site files). Confirm with `y`.
-6. **Final safety check** - you must type the **disk number** (Windows, for example `2`) or **device path** (Linux, for example `/dev/sdb`) again. This is your last chance to cancel.
-7. **Writing** - a progress bar shows. **Never remove the card while it is writing.**
-8. **Done** - when you see `DONE - card for s3-gw-03 is ready`, wait for the reader light to stop blinking, take the card out and **label it with its Gateway ID**.
+5. **Tailscale key (only for an image with Tailscale)** - the wizard looks inside the image when you choose it. If Tailscale is installed (the combined S3 + S5 image), it asks "Add a Tailscale auth key to this card?" See [Tailscale auth key](#tailscale-auth-key-combined-image) below. For any other image nothing is asked.
+6. **Summary** - it shows a "Please check" box (image, card, Gateway ID, Tailscale key, site files). Confirm with `y`.
+7. **Final safety check** - you must type the **disk number** (Windows, for example `2`) or **device path** (Linux, for example `/dev/sdb`) again. This is your last chance to cancel.
+8. **Writing** - a progress bar shows. **Never remove the card while it is writing.**
+9. **Done** - when you see `DONE - card for s3-gw-03 is ready`, wait for the reader light to stop blinking, take the card out and **label it with its Gateway ID**.
 
 The wizard then waits for you to remove the card before the next one, so the same card cannot be flashed twice by mistake.
 
@@ -128,6 +129,47 @@ What the wizard does:
 2. Shows the list and marks cards that were already flashed. You can choose to **skip those** (useful if a batch was interrupted).
 3. For each card, it says "Card 2 of 4: s3-gw-02", waits for you to insert a card, then asks: **Enter** = start, **s** = skip this card, **q** = stop the batch.
 4. Shows a summary at the end: how many were flashed, failed and skipped.
+
+### Tailscale auth key (combined image)
+
+An image built with Tailscale carries a first-boot join service. A card whose `provision.env` has a
+`TAILSCALE_AUTHKEY=` line joins your tailnet by itself once the gateway has been provisioned, and the gateway then
+removes the key from the card. A card without a key never joins.
+
+The wizards look **inside the image** (read-only, nothing is mounted) for Tailscale and its join service. Only
+then do they ask, so an S3-only or S5-only image behaves exactly as before:
+
+- **One card (option 1):** "Add a Tailscale auth key to this card?" Answer `y`, then paste the key
+  (`tskey-auth-...`). **Nothing is shown while you type.** Press Enter on its own to give up and flash without a key. For
+  the next card the wizard offers to reuse the same key (only works for a reusable key).
+- **Batch (option 2):** one question before the batch starts. The key then goes on **every** card, so it must be a
+  **reusable** key; a one-time key lets only the first gateway join.
+- **Change an ID (option 3):** the card itself is checked instead of an image.
+- The "Please check" box shows the key masked (`tskey-auth-...abcd`) or "no key - this card will not join a tailnet by
+  itself". The key is never written to `flash-log.csv`.
+
+Create the key in the Tailscale admin console under **Settings > Keys > Generate auth key**. Use a **pre-approved**
+key that **expires soon**, and a **tagged** one if your policy rules are written for `tag:gateway`: the key sits as plain
+text on the card's boot partition until the gateway has joined. API access tokens (`tskey-api-...`) and OAuth client
+secrets (`tskey-client-...`) are not auth keys and are refused, as is anything with `?` options.
+
+If the wizard says it "could not look inside the image", it needs `debugfs` (package `e2fsprogs`) on Linux, or an
+image with a standard MBR partition table. No key is asked for then; use the command line below.
+
+Command line: put the key on one line in a file, so it never shows up in the process list or your shell history.
+
+```bash
+sudo ./host/flash-and-provision.sh --image combined.img --device /dev/sdb --gateway-id s3-gw-03 \
+     --tailscale-authkey-file ./tailscale.key
+```
+
+```powershell
+.\host\flash-and-provision.ps1 -Image D:\images\combined.img -DiskNumber 2 -GatewayId s3-gw-03 -TailscaleAuthKeyFile .\tailscale.key
+```
+
+A key for an image (or, with `--no-flash` / `-NoFlash`, a card) that has no Tailscale is refused before anything is
+written. With `--batch` / `-Batch` the same key goes on every card. After first boot, check with
+`tailscale status` and `journalctl -t gateway-tailscale-join` on the gateway.
 
 ### Change an ID without re-flashing (option 3)
 
@@ -442,6 +484,7 @@ Run with `sudo`.
 | `--site NAME` | A site name. Used together with `--site-files-root`: the files come from `<root>/<NAME>`. |
 | `--site-files-root DIR` | The folder that holds all the site folders. |
 | `--batch FILE.csv` | Make many cards from a CSV list. Prompts between cards. |
+| `--tailscale-authkey-file FILE` | Combined image only. A file with one Tailscale auth key; the card joins your tailnet at first boot. See [Tailscale auth key](#tailscale-auth-key-combined-image). |
 | `--no-flash` | Do not write the image. Only write the ID and site files to a card that is already flashed. |
 | `-h`, `--help` | Show the built-in help. |
 

@@ -22,6 +22,10 @@
 #     fine) that skips cards already done;
 #   * on the combined S3 + S5 image, batch rows may carry zigbee_serial / rcp_serial columns; they are
 #     written to the card so the unit never has to probe its radios (see flash-and-provision.sh);
+#   * when the image has Tailscale installed (it looks inside the image), asks whether to put a Tailscale
+#     auth key on the card so the gateway joins your tailnet at first boot (single cards, and one reusable
+#     key for a whole batch); the key is typed hidden and handed to the flasher without showing up in the
+#     process list, and is never written to the log;
 #   * waits for you to remove each card before the next one (so a card can't be
 #     flashed twice by mistake);
 #   * keeps a record in host/flash-log.csv.
@@ -61,6 +65,10 @@ IMAGE_OK=0
 LAST_ID=""
 CARD_ZB=""      # radio serials for the card being flashed: set per row in batch mode,
 CARD_RCP=""     # empty (nothing written) for a single card
+IMAGE_TS=""     # does the chosen image have Tailscale (and its first-boot join)? yes / no / unknown
+TS_STATE=""     # the same for the card about to be written (from the image, or the card itself on a relabel)
+CARD_TS_KEY=""  # Tailscale auth key for the card being flashed (empty = none); held in memory only
+LAST_TS_KEY=""  # the key typed for the previous card, offered again for the next one
 LAST_SITE=""
 LAST_SITE_DIR=""
 FLASHING=0
@@ -251,6 +259,12 @@ verify_image() {
     IMAGE="$f"
     IMAGE_BYTES="$size"
     IMAGE_OK=1
+    IMAGE_TS="$(tailscale_in_image "$f")"
+    case "$IMAGE_TS" in
+        yes) ok "Tailscale is installed in this image: you will be asked about a Tailscale auth key for each card." ;;
+        no)  say "(Tailscale is not installed in this image, so no Tailscale key is asked for.)" ;;
+        *)   say "(Could not look inside the image to check for Tailscale - needs 'debugfs' from e2fsprogs. No Tailscale key is asked for.)" ;;
+    esac
     return 0
 }
 ensure_image() {
@@ -451,6 +465,48 @@ prompt_gateway_id() { # -> $GW_ID
         return 0
     done
 }
+# --- Tailscale auth key --------------------------------------------------------
+ask_secret() { # ask_secret "Question" -> $ANSWER  (what is typed is not shown)
+    local a
+    if ! read -r -s -p "$1: " a; then
+        echo; err "Input closed - exiting."; exit 1
+    fi
+    echo
+    ANSWER="$(clean_field "$a")"
+}
+read_tailscale_key() { # -> $ANSWER = a usable key, or "" if the operator gives up (Enter)
+    local problem
+    while true; do
+        ask_secret "Paste the Tailscale auth key (tskey-auth-..., not shown as you type; Enter = no key)"
+        [ -n "$ANSWER" ] || return 0
+        problem="$(tailscale_authkey_problem "$ANSWER")"
+        [ -z "$problem" ] && return 0
+        err "$problem."
+    done
+}
+say_tailscale_key_storage() {
+    say "The key is stored as plain text on the card's boot partition until the gateway has joined;"
+    say "the gateway then removes it. Use a pre-approved key that expires soon."
+}
+prompt_tailscale_key() { # mode -> $TS_STATE, $CARD_TS_KEY
+    local mode="$1"
+    CARD_TS_KEY=""
+    if [ "$mode" = relabel ]; then TS_STATE="$(tailscale_on_card "$DEVICE")"; else TS_STATE="${IMAGE_TS:-unknown}"; fi
+    [ "$TS_STATE" = yes ] || return 0
+    head1 "Tailscale"
+    say "Tailscale is installed in this image. A card that carries a Tailscale auth key joins your"
+    say "tailnet by itself at first boot; without one the gateway stays off the tailnet."
+    ask_yn "Add a Tailscale auth key to this card?" N || return 0
+    if [ -n "$LAST_TS_KEY" ] && ask_yn "Use the same key as the last card? (works only for a reusable key)" N; then
+        CARD_TS_KEY="$LAST_TS_KEY"
+        return 0
+    fi
+    say_tailscale_key_storage
+    read_tailscale_key
+    CARD_TS_KEY="$ANSWER"
+    if [ -n "$CARD_TS_KEY" ]; then LAST_TS_KEY="$CARD_TS_KEY"; fi
+}
+
 pick_site() { # -> $SITE, $SITE_DIR ; returns 1 to go back
     SITE=""; SITE_DIR=""
     local -a dirs=()
@@ -522,6 +578,13 @@ show_plan() { # mode id
     if [ -n "$CARD_ZB$CARD_RCP" ]; then
         printf '   %-12s zigbee %s, rcp %s\n' "Radios" "${CARD_ZB:-<probe>}" "${CARD_RCP:-<probe>}"
     fi
+    if [ "${TS_STATE:-}" = yes ]; then
+        if [ -n "${CARD_TS_KEY:-}" ]; then
+            printf '   %-12s auth key %s (joins the tailnet at first boot)\n' "Tailscale" "$(mask_tailscale_authkey "$CARD_TS_KEY")"
+        else
+            printf '   %-12s no key - this card will not join a tailnet by itself\n' "Tailscale"
+        fi
+    fi
     if [ -n "$SITE_DIR" ]; then
         site_inspect "$SITE_DIR"
         what="$SITE ($(join_by_comma "${SITE_FOUND[@]}"))"
@@ -544,7 +607,7 @@ run_flasher() { # mode id site_dir
     echo
     say "Starting. You will be asked to type the device path ($DEVICE) once more to confirm."
     FLASHING=1
-    bash "$FLASHER" "${args[@]}"
+    TAILSCALE_AUTHKEY="${CARD_TS_KEY:-}" bash "$FLASHER" "${args[@]}"     # the environment, not an argument: no key in `ps`
     rc=$?
     FLASHING=0
     return "$rc"
@@ -579,6 +642,7 @@ mode_single() {
         prompt_gateway_id
         pick_site || return
         pick_card flash || return
+        prompt_tailscale_key flash
         show_plan flash "$GW_ID"
         if ! ask_yn "Is this correct?" Y; then
             say "OK - let's start this card again."
@@ -602,6 +666,7 @@ mode_relabel() {
         prompt_gateway_id
         pick_site || return
         pick_card relabel || return
+        prompt_tailscale_key relabel
         show_plan relabel "$GW_ID"
         if ! ask_yn "Is this correct?" Y; then
             wait_for_removal "$DEVICE"
@@ -634,7 +699,7 @@ load_batch_csv() { # file -> B_ID / B_SITE / B_ZB / B_RCP ; returns 1 if anythin
     [ "$bad" = 0 ]
 }
 mode_batch() {
-    local csv i n skip_done=0 done_count=0 ok_n=0 fail_n=0 skip_n=0 site_dir act
+    local csv i n skip_done=0 done_count=0 ok_n=0 fail_n=0 skip_n=0 site_dir act batch_ts_key=""
     ensure_image || return
     head1 "Batch from a CSV list"
     say "The CSV needs a header line (gateway_id,site,notes) and one line per card."
@@ -658,10 +723,21 @@ mode_batch() {
     if [ "$done_count" -gt 0 ]; then
         if ask_yn "$done_count card(s) were already flashed. Skip those?" Y; then skip_done=1; fi
     fi
+    if [ "$IMAGE_TS" = yes ]; then
+        head1 "Tailscale"
+        say "Tailscale is installed in this image. One auth key can go on every card in this batch."
+        say "It must be a REUSABLE key: a one-time key lets only the first gateway join."
+        if ask_yn "Add a Tailscale auth key to every card in this batch?" N; then
+            say_tailscale_key_storage
+            read_tailscale_key
+            batch_ts_key="$ANSWER"
+        fi
+    fi
     ask_yn "Start the batch?" Y || return
     for ((i = 0; i < n; i++)); do
         GW_ID="${B_ID[i]}"; SITE="${B_SITE[i]}"; SITE_DIR=""
         CARD_ZB="${B_ZB[i]}"; CARD_RCP="${B_RCP[i]}"
+        TS_STATE="$IMAGE_TS"; CARD_TS_KEY="$batch_ts_key"
         [ -n "$SITE" ] && SITE_DIR="$SITE_ROOT/$SITE"
         if [ "$skip_done" = 1 ] && prior_use "$GW_ID" >/dev/null; then
             skip_n=$((skip_n + 1)); continue
