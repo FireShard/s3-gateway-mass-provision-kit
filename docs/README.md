@@ -180,6 +180,31 @@ Set the timezone to the location where the gateways will be used.
 
 Set the SSH public key if the default `pi` user should be accessible through SSH.
 
+### Tailscale (optional)
+
+Tailscale is **off by default**. To build an image that has it, set `S3_TAILSCALE_VERSION` in
+`image/gateway-golden.yaml` (under `env:`) to an exact package version, for example `1.80.2`. Leave it empty
+(`""`) and the image has no Tailscale at all; the `gateway-tailscale` repo is not needed either.
+
+```yaml
+env:
+  S3_TAILSCALE_VERSION: "1.80.2"     # "" = no Tailscale
+  S3_TAILSCALE_DIR: ""               # "" = the gateway-tailscale folder next to this kit
+```
+
+With a version set, the build installs `curl`, adds Tailscale's apt repository for Debian trixie inside the image and
+installs exactly that version, then installs the first-boot join service from the `gateway-tailscale` repo (put it
+next to this kit, or point `S3_TAILSCALE_DIR` at it). `tailscaled` is left **disabled**. The version has no default and
+`latest` is refused: the image is built from the version you name.
+
+The image never carries a Tailscale identity or auth key. The build fails if the finished image has `tailscaled`
+enabled or missing, anything in `/var/lib/tailscale`, the join script, service or timer missing, or an auth key in any
+text file under `/etc /var /boot /home /root /opt /srv`. A card joins the tailnet at first boot only if its
+`provision.env` has a `TAILSCALE_AUTHKEY=` line; the flash scripts offer to add one when they find Tailscale in the
+image (see *Combined S3 + S5 image: Tailscale auth key* below; it applies to every image that has Tailscale).
+To see whether a built unit has Tailscale: `ls /usr/sbin/tailscaled /usr/local/sbin/gateway-tailscale-join` (the same
+two files the flash scripts look for).
+
 ### MQTT
 
 If every gateway uses the same MQTT broker, configure the `MQTT_*` values in:

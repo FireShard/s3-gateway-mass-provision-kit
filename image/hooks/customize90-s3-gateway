@@ -31,11 +31,18 @@
 #   09:00 daily  s3-gateway-log-maintenance.timer  gzip rotated logs > 7 days into log/compressed/,
 #                                                  delete > 3 months
 # Midnight / 09:00 are the unit's local time, i.e. locale.timezone in gateway-golden.yaml.
+#
+# Tailscale is OPTIONAL. With S3_TAILSCALE_VERSION set (gateway-golden.yaml), exactly that tailscale package is
+# installed (left disabled) together with the first-boot join service from the gateway-tailscale repo (a sibling
+# folder of this kit, or S3_TAILSCALE_DIR). The image carries no Tailscale identity and no auth key: a card
+# joins the tailnet at first boot only if its provision.env has TAILSCALE_AUTHKEY. With it empty (the default)
+# there is no Tailscale in the image and the gateway-tailscale repo is not needed.
 set -euo pipefail
 
 ROOTFS="$1"
 HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$HOOK_DIR")"
+KIT_DIR="$(dirname "$PROJECT_DIR")"
 SRC="$PROJECT_DIR/s3-zigbee-gateway"
 FIRSTBOOT_SRC="$PROJECT_DIR/firstboot"
 
@@ -49,6 +56,10 @@ WEBADMIN_ENV="/etc/s3-gateway/webadmin.env"
 APP_ENV="$ROOTFS$TARGET_DIR/.env"
 SYSTEMD_DIR="$ROOTFS/etc/systemd/system"
 HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'    # same rule as first boot
+TAILSCALE_VERSION="${S3_TAILSCALE_VERSION:-}"                  # empty = no Tailscale in the image
+TAILSCALE_DIR="${S3_TAILSCALE_DIR:-$KIT_DIR/../gateway-tailscale}"   # where the gateway-tailscale repo is
+TS_VERSION_RE='^[0-9][A-Za-z0-9.+~:-]*$'                       # an exact package version; the rule gateway-tailscale/install.sh applies
+TAILSCALE_SRC=""                                               # the repo, resolved (set only when S3_TAILSCALE_VERSION is)
 
 # --- helpers --------------------------------------------------------------------
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -93,6 +104,73 @@ warn_missing_env_keys() {
     missing="$(comm -13 <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$env_file" | sort -u) \
                         <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$example" | sort -u) | tr -d '=' | tr '\n' ' ')"
     [ -z "$missing" ] || echo "WARNING: $env_file lacks keys that $(basename "$example") has: $missing" >&2
+}
+
+# --- Tailscale (optional) ---------------------------------------------------------
+# check_tailscale   pre-flight. S3_TAILSCALE_VERSION empty (or unset) = no Tailscale, and the gateway-tailscale
+#                   repo is not looked at. Set, it must be an exact apt version: the image is built from that
+#                   version only (no "latest"), so two builds of the same yaml give the same Tailscale.
+check_tailscale() {
+    [ -n "$TAILSCALE_VERSION" ] || return 0
+    [ "$TAILSCALE_VERSION" != "CHANGE-ME-BEFORE-BUILDING" ] \
+        || die "S3_TAILSCALE_VERSION in image/gateway-golden.yaml is still the placeholder. Set an exact version such as 1.80.2, or leave it empty to build without Tailscale."
+    [[ $TAILSCALE_VERSION =~ $TS_VERSION_RE ]] \
+        || die "S3_TAILSCALE_VERSION must be an exact version such as 1.80.2, or empty for no Tailscale (got '$TAILSCALE_VERSION')."
+    if [ -d "$TAILSCALE_DIR" ]; then TAILSCALE_SRC="$(CDPATH='' cd -- "$TAILSCALE_DIR" && pwd)"; fi
+    { [ -n "$TAILSCALE_SRC" ] && [ -f "$TAILSCALE_SRC/install.sh" ] && [ -f "$TAILSCALE_SRC/bin/gateway-tailscale-join" ]; } \
+        || die "S3_TAILSCALE_VERSION is set but the gateway-tailscale repo was not found (looked in '$TAILSCALE_DIR'). Put it next to this kit, set S3_TAILSCALE_DIR, or empty S3_TAILSCALE_VERSION to build without Tailscale."
+}
+
+# ts_in_rootfs CMD...   run a command inside the image, as in_chroot does. GTS_IN_ROOTFS, a command prefix,
+#                   replaces the chroot: gateway-tailscale/install.sh honours the same variable, which is how
+#                   the tests stand in for a rootfs.
+ts_in_rootfs() {
+    local prefix
+    if [ -n "${GTS_IN_ROOTFS:-}" ]; then read -r -a prefix <<< "$GTS_IN_ROOTFS"; else prefix=(chroot "$ROOTFS"); fi
+    "${prefix[@]}" "$@"
+}
+
+# install_tailscale   Tailscale, pinned, installed but left disabled, plus the first-boot join service.
+#                   install.sh fetches the apt repository with curl inside the image, so curl has to be there
+#                   (--no-install-recommends: nothing else should come along; ca-certificates is a dependency
+#                   of curl).
+install_tailscale() {
+    if [ -z "$TAILSCALE_VERSION" ]; then
+        echo "==> Tailscale: not installed by this hook (S3_TAILSCALE_VERSION is empty)"
+        return 0
+    fi
+    echo "==> Installing Tailscale $TAILSCALE_VERSION and the first-boot join service (gateway-tailscale)"
+    ts_in_rootfs apt-get update
+    ts_in_rootfs env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl
+    ROOT_PREFIX="$ROOTFS" bash "$TAILSCALE_SRC/install.sh" --install-package "$TAILSCALE_VERSION"
+}
+
+# tailscale_final_checks   with Tailscale: the join machinery is in, tailscaled is installed but off, and the
+#                   image carries no Tailscale identity and no auth key (every unit would otherwise share them).
+tailscale_final_checks() {
+    [ -n "$TAILSCALE_VERSION" ] || return 0
+    local f ts_state d hits=() scan=()
+    for f in /usr/local/sbin/gateway-tailscale-join \
+             /etc/systemd/system/gateway-tailscale-join.service \
+             /etc/systemd/system/gateway-tailscale-join.timer \
+             /etc/systemd/system/timers.target.wants/gateway-tailscale-join.timer; do    # resolved inside the rootfs
+        [ -e "$ROOTFS$f" ] || die "expected file missing from the image: $f"
+    done
+    ts_state="$(systemctl --root="$ROOTFS" is-enabled tailscaled.service 2>/dev/null || true)"
+    [ "$ts_state" = disabled ] \
+        || die "tailscaled.service must be installed but not enabled in the image (systemctl is-enabled says '${ts_state:-nothing}'). The join service enables it once a card has a key."
+    if [ -d "$ROOTFS/var/lib/tailscale" ] && [ -n "$(find "$ROOTFS/var/lib/tailscale" -mindepth 1 -print -quit)" ]; then
+        die "/var/lib/tailscale is not empty: the image would carry a Tailscale identity that every unit would share."
+    fi
+    for d in etc var boot home root opt srv; do
+        if [ -d "$ROOTFS/$d" ]; then scan+=("$ROOTFS/$d"); fi
+    done
+    if [ "${#scan[@]}" -gt 0 ]; then
+        # Text files only; /usr is left out on purpose (the join script's own text mentions TAILSCALE_AUTHKEY=). Prints names, never contents.
+        mapfile -t hits < <(grep -rIls -e 'tskey-' -e '^[[:space:]]*TAILSCALE_AUTHKEY=[^[:space:]]' "${scan[@]}" || true)
+        [ "${#hits[@]}" -eq 0 ] \
+            || die "a Tailscale auth key is in the image: ${hits[*]#"$ROOTFS"}. Keys belong on the card's provision.env, never in the image."
+    fi
 }
 
 # --- pre-flight: fail here, in seconds, not after the apt/pip steps --------------
@@ -190,6 +268,8 @@ BAKED_GATEWAY_ID="${GATEWAY_ID:-}"
 if [ -n "$BAKED_GATEWAY_ID" ] && ! [[ $BAKED_GATEWAY_ID =~ $HOSTNAME_RE ]]; then
     die "GATEWAY_ID '$BAKED_GATEWAY_ID' is not a valid hostname (letters, digits and '-', max 63, no leading/trailing '-')."
 fi
+
+check_tailscale
 
 if [ "$MANAGE_NETWORK" = yes ]; then
 # --- networking override ---------------------------------------------------------
@@ -601,6 +681,8 @@ else
     echo "==> S3_MANAGE_NETWORK=no: not touching NetworkManager / systemd-networkd (another hook owns networking)"
 fi
 
+install_tailscale
+
 echo "==> Enabling units (offline, via systemctl --root - no live manager needed)"
 # NetworkManager-wait-online is what makes network-online.target mean something
 # now that systemd-networkd-wait-online is masked.
@@ -614,5 +696,7 @@ fi
 for unit in "${ENABLE_UNITS[@]}"; do
     systemctl --root="$ROOTFS" enable "$unit"
 done
+
+tailscale_final_checks
 
 echo "==> customize90-s3-gateway complete"
